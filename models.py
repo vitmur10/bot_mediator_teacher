@@ -24,7 +24,7 @@ class Group(Base):
     teacher = relationship(
         "User",
         foreign_keys=[teacher_id],
-        backref="teaching_groups",  # опціонально: teacher.teaching_groups
+        backref="teaching_groups",  # teacher.teaching_groups
     )
 
     # Учні групи (багато) – явно кажемо, що FK на нас це User.group_id
@@ -42,16 +42,25 @@ class User(Base):
     role = Column(String(20), nullable=False, default="student")  # student/teacher/admin
     display_name = Column(String(255), nullable=True)
 
-    # Нова колонка: до якої групи належить учень
+    # До якої групи належить учень
     group_id = Column(Integer, ForeignKey("groups.id"), nullable=True)
-    group = relationship("Group", back_populates="students")
 
-    # НОВА КОЛОНКА: прямий викладач (1-на-1)
+    # Прямий викладач (1-на-1)
     assigned_teacher_id = Column(BigInteger, ForeignKey("users.id"), nullable=True)
+
+    # Група учня – ТУТ додаємо foreign_keys, щоб зняти двозначність
+    group = relationship(
+        "Group",
+        back_populates="students",
+        foreign_keys=[group_id],
+    )
+
+    # Self-FK: student.assigned_teacher → User (teacher)
     assigned_teacher = relationship(
         "User",
         foreign_keys=[assigned_teacher_id],
-        backref="assigned_students",
+        remote_side=[id],            # вказуємо, що посилаємось на User.id
+        backref="assigned_students", # teacher.assigned_students – список студентів 1-на-1
     )
 
     messages_from = relationship(
@@ -64,6 +73,7 @@ class User(Base):
         back_populates="to_user",
         foreign_keys="Message.to_user_id",
     )
+
 
 class Message(Base):
     __tablename__ = "messages"
