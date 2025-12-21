@@ -238,8 +238,7 @@ async def _render_students_page(target_message: Message, page: int = 0) -> None:
 async def _render_history_page(
         target_message: Message,
         student_id: int,
-        page: int = 0,
-) -> None:
+        page: int = 0,) -> None:
     """
     Малює сторінку історії з конкретним учнем + інлайн-пагінацію.
     """
@@ -303,7 +302,18 @@ async def _render_history_page(
             else "Вчитель → Учень"
         )
         prefix = f"[{ts}] {direction}"
-        body = m.text or ""
+
+        parts: list[str] = []
+
+        if m.has_media:
+            # простий маркер, що в цьому місці було медіа
+            parts.append("[Медіа]")
+
+        if m.text:
+            parts.append(m.text)
+
+        body = "\n".join(parts) if parts else ""
+
         lines.append(f"{prefix}\n{body}\n")
 
     text = "\n".join(lines)
