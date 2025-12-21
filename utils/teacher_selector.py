@@ -12,12 +12,17 @@ settings = get_settings()
 async def select_teacher_for_student(student: User) -> int:
     """
     Логіка:
+    0. Якщо у студента є прямий викладач (assigned_teacher_id) — повертаємо його.
     1. Якщо у студента є group_id і в групи є teacher_id — повертаємо його.
-    2. Інакше – пробуємо знайти будь-якого користувача з role='teacher' у БД.
+    2. Якщо ні — шукаємо будь-якого teacher у БД.
     """
 
-    # 1) пробуємо взяти вчителя з групи
-    if student.group_id:
+    # 0) прямий викладач 1-на-1
+    if getattr(student, "assigned_teacher_id", None):
+        return student.assigned_teacher_id
+
+    # 1) вчитель з групи
+    if getattr(student, "group_id", None):
         async with AsyncSessionLocal() as session:
             res = await session.execute(
                 select(Group).where(Group.id == student.group_id)

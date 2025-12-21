@@ -3,7 +3,7 @@ from datetime import datetime
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 
 from config import get_settings
 from db import AsyncSessionLocal
@@ -1213,3 +1213,184 @@ async def admin_remove_admin(message: Message):
     await message.answer(
         f"Користувача {admin_user.display_name or admin_user.id} більше не вважаємо 'admin'."
     )
+
+@router.message(F.text.startswith("/assign_teacher"))
+async def admin_assign_teacher_1to1(message: Message):
+    """
+    /assign_teacher <учень> <викладач>
+
+    Прив'язка студента до викладача 1-на-1, поверх груп.
+    Обидва параметри можна вказати як id або частину імені.
+    """
+    if not await is_admin(message.from_user.id):
+        return
+
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer(
+            "Формат: /assign_teacher <учень> <викладач>\n"
+            "Можна вказувати id або імʼя (display name)."
+        )
+        return
+
+    _, student_ident, teacher_ident = parts
+
+    async with AsyncSessionLocal() as session:
+        # ---- шукаємо студента ----
+        students_q = select(User).where(User.role == "student")
+
+        # спроба як id
+        try:
+            sid = int(student_ident)
+        except ValueError:
+            sid = None
+
+        student = None
+        if sid is not None:
+            res = await session.execute(students_q.where(User.id == sid))
+            student = res.scalar_one_or_none()
+
+        if not student:
+            pattern = f"%{student_ident}%"
+            res = await session.execute(
+                students_q.where(
+                    or_(
+                        func.lower(User.display_name) == student_ident.lower(),
+                        User.display_name.ilike(pattern),
+                    )
+                )
+            )
+            students = res.scalars().all()
+            if not students:
+                await message.answer("Учня з таким іменем або id не знайдено.")
+                return
+            if len(students) > 1:
+                lines = ["Знайдено кілька учнів:"]
+                for s in students:
+                    lines.append(f"{s.display_name or '—'} — {s.id}")
+                lines.append(
+                    "Уточніть, будь ласка, за ID або повним імʼям у /assign_teacher."
+                )
+                await message.answer("\n".join(lines))
+                return
+            student = students[0]
+
+        # ---- шукаємо викладача ----
+        teachers_q = select(User).where(User.role == "teacher")
+
+        try:
+            tid = int(teacher_ident)
+        except ValueError:
+            tid = None
+
+        teacher = None
+        if tid is not None:
+            res = await session.execute(teachers_q.where(User.id == tid))
+            teacher = res.scalar_one_or_none()
+
+        if not teacher:
+            pattern = f"%{teacher_ident}%"
+            res = await session.execute(
+                teachers_q.where(
+                    or_(
+                        func.lower(User.display_name) == teacher_ident.lower(),
+                        User.display_name.ilike(pattern),
+                    )
+                )
+            )
+            teachers = res.scalars().all()
+            if not teachers:
+                await message.answer("Викладача з таким іменем або id не знайдено.")
+                return
+            if len(teachers) > 1:
+                lines = ["Знайдено кілька викладачів:"]
+                for t in teachers:
+                    lines.append(f"{t.display_name or '—'} — {t.id}")
+                lines.append(
+                    "Уточніть, будь ласка, за ID або повним імʼям у /assign_teacher."
+                )
+                await message.answer("\n".join(lines))
+                return
+            teacher = teachers[0]
+
+        # ---- записуємо прив'язку 1-на-1 ----
+        student.assigned_teacher_id = teacher.id
+        await session.commit()
+
+        await message.answer(
+            f"Учня {student.display_name or student.id} привʼязано до викладача "
+            f"{teacher.display_name or teacher.id} в режимі 1-на-1."
+        )
+
+
+@router.message(F.text.startswith("/unassign_teacher"))
+async def admin_unassign_teacher_1to1(message: Message):
+    """
+    /unassign_teacher <учень>
+
+    Забирає прямого викладача 1-на-1 (assigned_teacher_id = NULL).
+    """
+    if not await is_admin(message.from_user.id):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Формат: /unassign_teacher <учень>\n"
+            "Можна вказати id або імʼя (display name)."
+        )
+        return
+
+    student_ident = parts[1]
+
+    async with AsyncSessionLocal() as session:
+        students_q = select(User).where(User.role == "student")
+
+        # пробуємо як id
+        try:
+            sid = int(student_ident)
+        except ValueError:
+            sid = None
+
+        student = None
+        if sid is not None:
+            res = await session.execute(students_q.where(User.id == sid))
+            student = res.scalar_one_or_none()
+
+        if not student:
+            pattern = f"%{student_ident}%"
+            res = await session.execute(
+                students_q.where(
+                    or_(
+                        func.lower(User.display_name) == student_ident.lower(),
+                        User.display_name.ilike(pattern),
+                    )
+                )
+            )
+            students = res.scalars().all()
+            if not students:
+                await message.answer("Учня з таким іменем або id не знайдено.")
+                return
+            if len(students) > 1:
+                lines = ["Знайдено кілька учнів:"]
+                for s in students:
+                    lines.append(f"{s.display_name or '—'} — {s.id}")
+                lines.append(
+                    "Уточніть, будь ласка, за ID або повним імʼям у /unassign_teacher."
+                )
+                await message.answer("\n".join(lines))
+                return
+            student = students[0]
+
+        if student.assigned_teacher_id is None:
+            await message.answer(
+                "У цього учня немає прямого викладача 1-на-1 (assigned_teacher_id порожнє)."
+            )
+            return
+
+        student.assigned_teacher_id = None
+        await session.commit()
+
+        await message.answer(
+            f"Для учня {student.display_name or student.id} скасовано привʼязку 1-на-1."
+        )
