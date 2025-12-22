@@ -8,7 +8,7 @@ from sqlalchemy import select, func, or_
 from config import get_settings
 from db import AsyncSessionLocal
 from models import Message as DbMessage, User, Group
-from utils.roles import is_admin
+from utils.roles import is_admin, is_teacher
 
 router = Router()
 settings = get_settings()
@@ -476,21 +476,17 @@ async def admin_history_callback(callback: CallbackQuery):
     Обробка кліку по інлайн-кнопці з /students та пагінації історії.
     data: hist:<student_id>:<page> або hist:<student_id> (тоді сторінка 0)
     """
-    if not callback.from_user or not await is_admin(callback.from_user.id):
+    if not callback.from_user or not (
+        await is_admin(callback.from_user.id) or await is_teacher(callback.from_user.id)
+    ):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
 
     data = callback.data or ""
     try:
         parts = data.split(":")
-        # варіанти:
-        # ["hist", "<id>"]
-        # ["hist", "<id>", "<page>"]
         student_id = int(parts[1])
-        if len(parts) >= 3:
-            page = int(parts[2])
-        else:
-            page = 0
+        page = int(parts[2]) if len(parts) >= 3 else 0
     except Exception:
         await callback.answer("Некоректні дані кнопки.", show_alert=True)
         return
@@ -505,21 +501,29 @@ async def admin_groups(message: Message):
         return
 
     async with AsyncSessionLocal() as session:
-        res = await session.execute(select(Group))
-        groups = res.scalars().all()
+        # робимо JOIN щоб отримати також User (teacher)
+        res = await session.execute(
+            select(Group, User)
+            .join(User, Group.teacher_id == User.id, isouter=True)
+        )
+        rows = res.all()
 
-    if not groups:
+    if not rows:
         await message.answer("Груп поки немає.")
         return
 
     lines: list[str] = ["Список груп:"]
-    for g in groups:
-        teacher_info = "не призначено"
-        if g.teacher_id:
-            teacher_info = f"teacher_id={g.teacher_id}"
-        lines.append(f"{g.id}: {g.name} (вчитель: {teacher_info})")
+
+    for group, teacher in rows:
+        if teacher:
+            teacher_info = f"{teacher.display_name or teacher.id} (id {teacher.id})"
+        else:
+            teacher_info = "не призначено"
+
+        lines.append(f"{group.id}: {group.name} — вчитель: {teacher_info}")
 
     await message.answer("\n".join(lines))
+
 
 
 @router.message(F.text.startswith("/add_group"))

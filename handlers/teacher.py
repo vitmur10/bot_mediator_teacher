@@ -1,12 +1,75 @@
 from aiogram import Router, F
 from aiogram.types import Message
 from sqlalchemy import select, func, or_
-
 from db import AsyncSessionLocal
 from models import Message as DbMessage, TeacherMessageLink, User
 from utils.roles import is_teacher
+from aiogram.types import CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 router = Router()
+PENDING_TO_STUDENT: dict[int, int] = {}
+TO_STUDENTS_PER_PAGE = 10
+
+
+async def _render_to_students_page(target_message: Message, teacher_id: int, page: int = 0) -> None:
+    """
+    Список учнів для команди /to з пагінацією.
+    Зараз показуємо всіх студентів; за бажанням можна відфільтрувати тільки
+    "своїх" (по групах/assigned_teacher).
+    """
+    async with AsyncSessionLocal() as session:
+        count_res = await session.execute(
+            select(func.count(User.id)).where(User.role == "student")
+        )
+        total_students = count_res.scalar() or 0
+
+        if total_students == 0:
+            await target_message.edit_text("Учнів поки немає.", reply_markup=None)
+            return
+
+        total_pages = (total_students + TO_STUDENTS_PER_PAGE - 1) // TO_STUDENTS_PER_PAGE
+        if page < 0:
+            page = 0
+        if page >= total_pages:
+            page = total_pages - 1
+
+        offset = page * TO_STUDENTS_PER_PAGE
+
+        res = await session.execute(
+            select(User)
+            .where(User.role == "student")
+            .order_by(User.display_name)
+            .offset(offset)
+            .limit(TO_STUDENTS_PER_PAGE)
+        )
+        students = res.scalars().all()
+
+    kb = InlineKeyboardBuilder()
+    for u in students:
+        name = u.display_name or f"ID {u.id}"
+        kb.button(
+            text=name,
+            callback_data=f"to_sel:{u.id}:{page}",
+        )
+    kb.adjust(1)
+
+    # пагінація
+    if page > 0:
+        kb.button(
+            text="⬅️ Попередня сторінка",
+            callback_data=f"to_page:{page - 1}",
+        )
+    if page < total_pages - 1:
+        kb.button(
+            text="➡️ Наступна сторінка",
+            callback_data=f"to_page:{page + 1}",
+        )
+
+    kb.adjust(1)
+
+    header = f"Оберіть учня для відповіді (сторінка {page + 1}/{total_pages}):"
+    await target_message.edit_text(header, reply_markup=kb.as_markup())
 
 
 def _extract_media_info(message: Message):
@@ -169,14 +232,23 @@ async def teacher_reply(message: Message):
 @router.message(F.text.startswith("/to"))
 async def teacher_to_command(message: Message):
     """
-    /to <ім'я_або_id_учня> <текст>
-    Важливо: тут підтримуємо текстові повідомлення.
-    Для медіа краще використовувати Reply.
+    Варіанти:
+    1) /to <ім'я_або_id_учня> <текст>  — як раніше, одразу надсилаємо.
+    2) /to                            — показати список учнів інлайн-кнопками,
+                                        обрати учня, а потім надіслати йому текст.
     """
     if not await is_teacher(message.from_user.id):
         return
 
     parts = message.text.split(maxsplit=2)
+
+    # Випадок 2: лише "/to" без аргументів – запускаємо режим вибору учня
+    if len(parts) == 1:
+        sent = await message.answer("Завантаження списку учнів...")
+        await _render_to_students_page(sent, teacher_id=message.from_user.id, page=0)
+        return
+
+    # Випадок 1: старий формат /to <name_or_id> <text>
     if len(parts) < 3:
         await message.answer("Формат: /to <ім'я_або_id_учня> <текст>")
         return
@@ -184,8 +256,7 @@ async def teacher_to_command(message: Message):
     _, raw_name, text = parts
 
     async with AsyncSessionLocal() as session:
-        # пошук учня по id або імені (як було раніше)
-        # спочатку пробуємо як id
+        # спроба як id
         student = None
         try:
             sid = int(raw_name)
@@ -219,15 +290,12 @@ async def teacher_to_command(message: Message):
                 lines = ["Знайдено кілька учнів:"]
                 for s in students:
                     lines.append(f"{s.display_name or '—'} — {s.id}")
-                lines.append(
-                    "Уточніть, будь ласка, за ID або повним ім'ям."
-                )
+                lines.append("Уточніть, будь ласка, за ID або повним ім'ям.")
                 await message.answer("\n".join(lines))
                 return
 
             student = students[0]
 
-        # тут для простоти в /to працюємо тільки з текстом
         sent = await message.bot.send_message(
             chat_id=student.id,
             text=text,
@@ -248,3 +316,116 @@ async def teacher_to_command(message: Message):
     await message.answer(
         f"Повідомлення надіслано учню: {student.display_name or student.id}"
     )
+
+
+@router.callback_query(F.data.startswith("to_page:"))
+async def teacher_to_page_callback(callback: CallbackQuery):
+    if not await is_teacher(callback.from_user.id):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+
+    data = callback.data or ""
+    try:
+        _, raw_page = data.split(":", 1)
+        page = int(raw_page)
+    except Exception:
+        await callback.answer("Помилка пагінації.", show_alert=True)
+        return
+
+    await _render_to_students_page(callback.message, teacher_id=callback.from_user.id, page=page)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("to_sel:"))
+async def teacher_to_select_student(callback: CallbackQuery):
+    """
+    Клік по учню в режимі /to.
+    data: to_sel:<student_id>:<page>
+    """
+    if not await is_teacher(callback.from_user.id):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+
+    data = callback.data or ""
+    try:
+        _, raw_student_id, raw_page = data.split(":", 2)
+        student_id = int(raw_student_id)
+        page = int(raw_page)
+    except Exception:
+        await callback.answer("Некоректні дані кнопки.", show_alert=True)
+        return
+
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(
+            select(User).where(User.id == student_id, User.role == "student")
+        )
+        student = res.scalar_one_or_none()
+
+    if not student:
+        await callback.answer("Учня не знайдено.", show_alert=True)
+        return
+
+    # запам'ятовуємо, кому наступне повідомлення вчителя треба відправити
+    PENDING_TO_STUDENT[callback.from_user.id] = student_id
+
+    await callback.message.edit_text(
+        f"Учень обраний: {student.display_name or student.id}.\n"
+        f"Надішліть наступним повідомленням текст — я перешлю його цьому учню.",
+        reply_markup=None,
+    )
+    await callback.answer("Учень обраний.")
+
+
+@router.message(F.chat.type == "private")
+async def teacher_free_text_after_to(message: Message):
+    """
+    Якщо вчитель щойно обрав учня через /to (інлайн), то
+    наступне його повідомлення без команди й без Reply
+    вважаємо повідомленням цьому учню.
+    """
+    if not await is_teacher(message.from_user.id):
+        return
+
+    # Якщо це команда або reply — нехай обробляють інші хендлери
+    if message.text and message.text.startswith("/"):
+        return
+    if message.reply_to_message:
+        return
+
+    student_id = PENDING_TO_STUDENT.get(message.from_user.id)
+    if not student_id:
+        return  # нічого не обрано – не чіпаємо
+
+    # Визначаємо текст/медіа і відправляємо учню так само, як у reply-хендлері
+    async with AsyncSessionLocal() as session:
+        res_student = await session.execute(
+            select(User).where(User.id == student_id)
+        )
+        student = res_student.scalar_one_or_none()
+        if not student:
+            await message.answer("Учня не знайдено в базі.")
+            PENDING_TO_STUDENT.pop(message.from_user.id, None)
+            return
+
+        sent, text, has_media, media_file_id = await _send_to_student_via_bot(
+            message, student.id
+        )
+
+        db_msg = DbMessage(
+            from_user_id=message.from_user.id,
+            to_user_id=student.id,
+            direction="teacher_to_student",
+            text=text,
+            has_media=has_media,
+            media_file_id=media_file_id,
+            tg_message_id=sent.message_id,
+        )
+        session.add(db_msg)
+        await session.commit()
+
+    await message.answer(
+        f"Повідомлення надіслано учню: {student.display_name or student.id}"
+    )
+
+    # очищаємо стан – щоб наступні повідомлення не йшли автоматом цьому учню
+    PENDING_TO_STUDENT.pop(message.from_user.id, None)

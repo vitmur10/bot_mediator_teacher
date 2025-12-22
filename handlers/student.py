@@ -7,7 +7,7 @@ from models import Message as DbMessage, TeacherMessageLink
 from utils.roles import is_teacher, is_admin, get_or_create_user
 from utils.teacher_selector import select_teacher_for_student
 from config import get_settings
-
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 router = Router()
 settings = get_settings()
 
@@ -63,6 +63,20 @@ async def student_message(message: Message):
         media_file_id = message.video.file_id
         media_kind = "video"
 
+    # ---- Формуємо заголовок для викладача ----
+    display = student.display_name or f"ID {student.id}"
+    header = f"👤 Учень: {display} (id: {student.id})"
+    body = text or ""
+    full_text = f"{header}\n\n{body}" if body else header
+
+    # Кнопка "Історія з цим учнем"
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="📜 Історія з цим учнем",
+        callback_data=f"hist:{student.id}:0",
+    )
+    kb.adjust(1)
+
     async with AsyncSessionLocal() as session:
         db_msg = DbMessage(
             from_user_id=student.id,
@@ -81,43 +95,49 @@ async def student_message(message: Message):
                 sent = await message.bot.send_photo(
                     chat_id=teacher_id,
                     photo=media_file_id,
-                    caption=text or None,
+                    caption=full_text if len(full_text) <= 1024 else full_text[:1020] + "…",
+                    reply_markup=kb.as_markup(),
                 )
             elif media_kind == "document":
                 sent = await message.bot.send_document(
                     chat_id=teacher_id,
                     document=media_file_id,
-                    caption=text or None,
+                    caption=full_text if len(full_text) <= 1024 else full_text[:1020] + "…",
+                    reply_markup=kb.as_markup(),
                 )
             elif media_kind == "voice":
                 sent = await message.bot.send_voice(
                     chat_id=teacher_id,
                     voice=media_file_id,
-                    caption=text or None,
+                    caption=full_text if len(full_text) <= 1024 else full_text[:1020] + "…",
+                    reply_markup=kb.as_markup(),
                 )
             elif media_kind == "audio":
                 sent = await message.bot.send_audio(
                     chat_id=teacher_id,
                     audio=media_file_id,
-                    caption=text or None,
+                    caption=full_text if len(full_text) <= 1024 else full_text[:1020] + "…",
+                    reply_markup=kb.as_markup(),
                 )
             elif media_kind == "video":
                 sent = await message.bot.send_video(
                     chat_id=teacher_id,
                     video=media_file_id,
-                    caption=text or None,
+                    caption=full_text if len(full_text) <= 1024 else full_text[:1020] + "…",
+                    reply_markup=kb.as_markup(),
                 )
             else:
-                # на всякий випадок fallback — як текст
                 sent = await message.bot.send_message(
                     chat_id=teacher_id,
-                    text=text,
+                    text=full_text,
+                    reply_markup=kb.as_markup(),
                 )
         else:
             # тільки текст
             sent = await message.bot.send_message(
                 chat_id=teacher_id,
-                text=text,
+                text=full_text,
+                reply_markup=kb.as_markup(),
             )
 
         db_msg.tg_message_id = sent.message_id
