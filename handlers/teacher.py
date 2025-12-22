@@ -6,10 +6,16 @@ from models import Message as DbMessage, TeacherMessageLink, User
 from utils.roles import is_teacher
 from aiogram.types import CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
 
 router = Router()
 PENDING_TO_STUDENT: dict[int, int] = {}
 TO_STUDENTS_PER_PAGE = 10
+
+
+class ToState(StatesGroup):
+    waiting_message = State()
 
 
 async def _render_to_students_page(target_message: Message, teacher_id: int, page: int = 0) -> None:
@@ -337,11 +343,7 @@ async def teacher_to_page_callback(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("to_sel:"))
-async def teacher_to_select_student(callback: CallbackQuery):
-    """
-    Клік по учню в режимі /to.
-    data: to_sel:<student_id>:<page>
-    """
+async def teacher_to_select_student(callback: CallbackQuery, state: FSMContext):
     if not await is_teacher(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
@@ -350,7 +352,6 @@ async def teacher_to_select_student(callback: CallbackQuery):
     try:
         _, raw_student_id, raw_page = data.split(":", 2)
         student_id = int(raw_student_id)
-        page = int(raw_page)
     except Exception:
         await callback.answer("Некоректні дані кнопки.", show_alert=True)
         return
@@ -365,24 +366,21 @@ async def teacher_to_select_student(callback: CallbackQuery):
         await callback.answer("Учня не знайдено.", show_alert=True)
         return
 
-    # запам'ятовуємо, кому наступне повідомлення вчителя треба відправити
-    PENDING_TO_STUDENT[callback.from_user.id] = student_id
+    # Зберігаємо в FSM і вмикаємо режим очікування
+    await state.update_data(to_student_id=student_id)
+    await state.set_state(ToState.waiting_message)
 
     await callback.message.edit_text(
         f"Учень обраний: {student.display_name or student.id}.\n"
-        f"Надішліть наступним повідомленням текст — я перешлю його цьому учню.",
+        f"Надішліть наступним повідомленням текст/файл/голосове — я перешлю його цьому учню.\n"
+        f"Скасувати: /to_cancel",
         reply_markup=None,
     )
     await callback.answer("Учень обраний.")
 
 
-@router.message(F.chat.type == "private")
-async def teacher_free_text_after_to(message: Message):
-    """
-    Якщо вчитель щойно обрав учня через /to (інлайн), то
-    наступне його повідомлення без команди й без Reply
-    вважаємо повідомленням цьому учню.
-    """
+@router.message(ToState.waiting_message, F.chat.type == "private")
+async def teacher_free_text_after_to(message: Message, state: FSMContext):
     if not await is_teacher(message.from_user.id):
         return
 
@@ -392,26 +390,24 @@ async def teacher_free_text_after_to(message: Message):
     if message.reply_to_message:
         return
 
-    student_id = PENDING_TO_STUDENT.get(message.from_user.id)
+    data = await state.get_data()
+    student_id = data.get("to_student_id")
     if not student_id:
-        return  # нічого не обрано – не чіпаємо
+        # на всякий випадок
+        await state.clear()
+        return
 
-    # Визначаємо текст/медіа і відправляємо учню так само, як у reply-хендлері
     async with AsyncSessionLocal() as session:
-        res_student = await session.execute(
-            select(User).where(User.id == student_id)
-        )
+        res_student = await session.execute(select(User).where(User.id == student_id))
         student = res_student.scalar_one_or_none()
         if not student:
             await message.answer("Учня не знайдено в базі.")
-            PENDING_TO_STUDENT.pop(message.from_user.id, None)
+            await state.clear()
             return
 
-        sent, text, has_media, media_file_id = await _send_to_student_via_bot(
-            message, student.id
-        )
+        sent, text, has_media, media_file_id = await _send_to_student_via_bot(message, student.id)
 
-        db_msg = DbMessage(
+        session.add(DbMessage(
             from_user_id=message.from_user.id,
             to_user_id=student.id,
             direction="teacher_to_student",
@@ -419,13 +415,18 @@ async def teacher_free_text_after_to(message: Message):
             has_media=has_media,
             media_file_id=media_file_id,
             tg_message_id=sent.message_id,
-        )
-        session.add(db_msg)
+        ))
         await session.commit()
 
-    await message.answer(
-        f"Повідомлення надіслано учню: {student.display_name or student.id}"
-    )
+    await message.answer(f"Повідомлення надіслано учню: {student.display_name or student.id}")
 
-    # очищаємо стан – щоб наступні повідомлення не йшли автоматом цьому учню
-    PENDING_TO_STUDENT.pop(message.from_user.id, None)
+    # очищаємо стан
+    await state.clear()
+
+
+@router.message(F.text == "/to_cancel")
+async def teacher_to_cancel(message: Message, state: FSMContext):
+    if not await is_teacher(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer("Режим /to скасовано.")
