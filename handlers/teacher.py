@@ -2,7 +2,7 @@ from aiogram import Router, F
 from aiogram.types import Message
 from sqlalchemy import select, func, or_
 from db import AsyncSessionLocal
-from models import Message as DbMessage, TeacherMessageLink, User
+from models import Message as DbMessage, TeacherMessageLink, User, Group
 from utils.roles import is_teacher
 from aiogram.types import CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -21,30 +21,43 @@ class ToState(StatesGroup):
 async def _render_to_students_page(target_message: Message, teacher_id: int, page: int = 0) -> None:
     """
     Список учнів для команди /to з пагінацією.
-    Зараз показуємо всіх студентів; за бажанням можна відфільтрувати тільки
-    "своїх" (по групах/assigned_teacher).
+    Показує тільки "своїх" студентів:
+      - assigned_teacher_id == teacher_id
+      - або student.group.teacher_id == teacher_id
     """
+    # підзапит: групи цього вчителя
+    teacher_groups_sq = select(Group.id).where(Group.teacher_id == teacher_id).subquery()
+
+    # умова "мій студент"
+    my_students_filter = or_(
+        User.assigned_teacher_id == teacher_id,
+        User.group_id.in_(select(teacher_groups_sq.c.id)),
+    )
+
     async with AsyncSessionLocal() as session:
+        # рахуємо кількість тільки "моїх" студентів
         count_res = await session.execute(
-            select(func.count(User.id)).where(User.role == "student")
+            select(func.count(User.id)).where(
+                User.role == "student",
+                my_students_filter,
+            )
         )
         total_students = count_res.scalar() or 0
 
         if total_students == 0:
-            await target_message.edit_text("Учнів поки немає.", reply_markup=None)
+            await target_message.edit_text("Немає учнів, привʼязаних до вас.", reply_markup=None)
             return
 
         total_pages = (total_students + TO_STUDENTS_PER_PAGE - 1) // TO_STUDENTS_PER_PAGE
-        if page < 0:
-            page = 0
-        if page >= total_pages:
-            page = total_pages - 1
-
+        page = max(0, min(page, total_pages - 1))
         offset = page * TO_STUDENTS_PER_PAGE
 
         res = await session.execute(
             select(User)
-            .where(User.role == "student")
+            .where(
+                User.role == "student",
+                my_students_filter,
+            )
             .order_by(User.display_name)
             .offset(offset)
             .limit(TO_STUDENTS_PER_PAGE)
@@ -54,23 +67,14 @@ async def _render_to_students_page(target_message: Message, teacher_id: int, pag
     kb = InlineKeyboardBuilder()
     for u in students:
         name = u.display_name or f"ID {u.id}"
-        kb.button(
-            text=name,
-            callback_data=f"to_sel:{u.id}:{page}",
-        )
+        kb.button(text=name, callback_data=f"to_sel:{u.id}:{page}")
     kb.adjust(1)
 
     # пагінація
     if page > 0:
-        kb.button(
-            text="⬅️ Попередня сторінка",
-            callback_data=f"to_page:{page - 1}",
-        )
+        kb.button(text="⬅️ Попередня сторінка", callback_data=f"to_page:{page - 1}")
     if page < total_pages - 1:
-        kb.button(
-            text="➡️ Наступна сторінка",
-            callback_data=f"to_page:{page + 1}",
-        )
+        kb.button(text="➡️ Наступна сторінка", callback_data=f"to_page:{page + 1}")
 
     kb.adjust(1)
 
