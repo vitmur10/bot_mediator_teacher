@@ -85,6 +85,7 @@ async def student_message(message: Message):
             text=text,
             has_media=has_media,
             media_file_id=media_file_id,
+            media_kind=media_kind,
         )
         session.add(db_msg)
         await session.flush()

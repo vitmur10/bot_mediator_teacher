@@ -3,19 +3,151 @@ from datetime import datetime
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select, func, or_
-
+from sqlalchemy import select, func, or_, delete
 from config import get_settings
 from db import AsyncSessionLocal
-from models import Message as DbMessage, User, Group
+from models import Message as DbMessage, User, Group, TeacherMessageLink
 from utils.roles import is_admin, is_teacher
-
+from aiogram.exceptions import TelegramBadRequest
 router = Router()
 settings = get_settings()
-
+STUDENTS_PAGE_SIZE = 10
 STUDENTS_PER_PAGE = 10
 MSGS_PER_PAGE = 20
 UNASSIGNED_PER_PAGE = 10
+TEACHERS_PER_PAGE = 10
+ADMINS_PER_PAGE = 10
+DEL_STUDENTS_PER_PAGE = 10
+TLINK_TEACHERS_PER_PAGE = 10
+TLINK_STUDENTS_PER_PAGE = 10
+TEACHER_STUDENTS_PER_PAGE = 10
+
+
+def _norm(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+async def _find_students_by_query(session, q: str):
+    """
+    q: id або частина імені
+    повертає список студентів (може бути 0/1/багато)
+    """
+    q = q.strip()
+    # пробуємо як id
+    try:
+        sid = int(q)
+    except ValueError:
+        sid = None
+
+    if sid is not None:
+        res = await session.execute(
+            select(User).where(User.id == sid, User.role == "student")
+        )
+        st = res.scalar_one_or_none()
+        return [st] if st else []
+
+    # інакше пошук по імені
+    pattern = f"%{q}%"
+    res = await session.execute(
+        select(User).where(
+            User.role == "student",
+            User.display_name.is_not(None),
+            or_(
+                func.lower(User.display_name) == q.lower(),
+                User.display_name.ilike(pattern),
+            ),
+        ).order_by(User.display_name)
+    )
+    return res.scalars().all()
+
+
+async def safe_edit_message(msg: Message, text: str, reply_markup=None):
+    """
+    Якщо msg текстове -> edit_text
+    Якщо msg медіа (має caption або content_type != 'text') -> edit_caption
+    Якщо редагування неможливе -> надсилаємо нове повідомлення
+    """
+    try:
+        # Якщо це звичайне текстове повідомлення
+        if msg.content_type == "text":
+            return await msg.edit_text(text, reply_markup=reply_markup)
+
+        # Якщо це медіа (photo/video/document/voice/audio...)
+        return await msg.edit_caption(text, reply_markup=reply_markup)
+
+    except TelegramBadRequest:
+        # fallback: надіслати нове повідомлення (щоб не падало)
+        return await msg.answer(text, reply_markup=reply_markup)
+
+
+async def _render_students_toggle_page(target_message: Message, page: int = 0):
+    """
+    Список студентів з кнопками Activate/Deactivate.
+    """
+    async with AsyncSessionLocal() as session:
+        count_res = await session.execute(
+            select(func.count(User.id)).where(User.role == "student")
+        )
+        total = count_res.scalar() or 0
+
+        if total == 0:
+            await target_message.edit_text("Студентів поки немає.", reply_markup=None)
+            return
+
+        total_pages = (total + STUDENTS_PAGE_SIZE - 1) // STUDENTS_PAGE_SIZE
+        page = max(0, min(page, total_pages - 1))
+        offset = page * STUDENTS_PAGE_SIZE
+
+        res = await session.execute(
+            select(User)
+            .where(User.role == "student")
+            .order_by(User.display_name)
+            .offset(offset)
+            .limit(STUDENTS_PAGE_SIZE)
+        )
+        students = res.scalars().all()
+
+    kb = InlineKeyboardBuilder()
+
+    for s in students:
+        name = s.display_name or f"ID {s.id}"
+        status = "✅ active" if getattr(s, "is_active", True) else "⛔ inactive"
+        # Заголовок-рядок (не кнопка)
+        kb.button(text=f"👤 {name} — {status}", callback_data="noop")
+
+        # Кнопки дії
+        if getattr(s, "is_active", True):
+            kb.button(text="🛑 Deactivate", callback_data=f"stu_deact:{s.id}:{page}")
+        else:
+            kb.button(text="✅ Activate", callback_data=f"stu_act:{s.id}:{page}")
+
+        kb.adjust(1, 1)  # заголовок, потім кнопка
+
+    # пагінація
+    nav = InlineKeyboardBuilder()
+    if page > 0:
+        nav.button(text="⬅️", callback_data=f"stu_page:{page - 1}")
+    nav.button(text=f"{page + 1}/{total_pages}", callback_data="noop")
+    if page < total_pages - 1:
+        nav.button(text="➡️", callback_data=f"stu_page:{page + 1}")
+    nav.adjust(3)
+
+    # додаємо рядок навігації в кінець
+    for row in nav.export():
+        kb.row(*row)
+
+    await target_message.edit_text(
+        "Оберіть студента для активації/деактивації:",
+        reply_markup=kb.as_markup(),
+    )
+
+
+def _sname(u: User) -> str:
+    return (u.display_name or f"ID {u.id}").strip()
+
+
+def _status_emoji(active: bool) -> str:
+    return "🟢" if active else "🔴"
 
 
 def _format_dt(dt: datetime | None) -> str:
@@ -26,6 +158,96 @@ def _format_dt(dt: datetime | None) -> str:
     if not dt:
         return ""
     return dt.strftime("%d.%m %H:%M")
+
+
+@router.callback_query(F.data == "noop")
+async def _noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+async def _set_student_active(student_id: int, is_active: bool) -> tuple[bool, str]:
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(
+            select(User).where(User.id == student_id, User.role == "student")
+        )
+        st = res.scalar_one_or_none()
+        if not st:
+            return False, "Студента не знайдено."
+
+        if not hasattr(st, "is_active"):
+            return False, "У моделі User немає поля is_active."
+
+        st.is_active = is_active
+        await session.commit()
+        return True, f"{st.display_name or st.id}"
+
+
+async def _render_teacher_students_page(target_message: Message, teacher_id: int, page: int = 0) -> None:
+    async with AsyncSessionLocal() as session:
+        teacher = (await session.execute(
+            select(User).where(User.id == teacher_id, User.role == "teacher")
+        )).scalar_one_or_none()
+
+        if not teacher:
+            await target_message.edit_text("Викладача не знайдено.", reply_markup=None)
+            return
+
+        # Учні викладача:
+        # - assigned_teacher_id = teacher_id
+        # - або student.group_id in groups where teacher_id=teacher_id
+        group_ids = (await session.execute(
+            select(Group.id).where(Group.teacher_id == teacher_id)
+        )).scalars().all()
+
+        base_q = select(User).where(
+            User.role == "student",
+            (
+                    (User.assigned_teacher_id == teacher_id)
+                    | (User.group_id.in_(group_ids) if group_ids else False)
+            )
+        )
+
+        count_res = await session.execute(select(func.count()).select_from(base_q.subquery()))
+        total = count_res.scalar() or 0
+
+        if total == 0:
+            kb = InlineKeyboardBuilder()
+            kb.button(text="⬅️ Назад до викладачів", callback_data="tch_page:0")
+            await target_message.edit_text(
+                f"{_sname(teacher)}\nУчнів поки немає.",
+                reply_markup=kb.as_markup(),
+            )
+            return
+
+        total_pages = (total + TEACHER_STUDENTS_PER_PAGE - 1) // TEACHER_STUDENTS_PER_PAGE
+        page = max(0, min(page, total_pages - 1))
+        offset = page * TEACHER_STUDENTS_PER_PAGE
+
+        students = (await session.execute(
+            base_q.order_by(User.display_name).offset(offset).limit(TEACHER_STUDENTS_PER_PAGE)
+        )).scalars().all()
+
+    kb = InlineKeyboardBuilder()
+    for s in students:
+        kb.button(
+            text=f"{_status_emoji(s.is_active)} {_sname(s)}",
+            callback_data=f"stu:{teacher_id}:{s.id}:{page}",
+        )
+    kb.adjust(1)
+
+    # pagination
+    if page > 0:
+        kb.button(text="⬅️ Назад", callback_data=f"tch:{teacher_id}:{page - 1}")
+    if page < total_pages - 1:
+        kb.button(text="➡️ Далі", callback_data=f"tch:{teacher_id}:{page + 1}")
+
+    kb.button(text="⬅️ До списку викладачів", callback_data="tch_page:0")
+    kb.adjust(1)
+
+    await target_message.edit_text(
+        f"👨‍🏫 {_sname(teacher)}\nУчні (сторінка {page + 1}/{total_pages}):",
+        reply_markup=kb.as_markup(),
+    )
 
 
 async def _find_teachers_by_identifier(session, identifier: str) -> list[User]:
@@ -235,10 +457,20 @@ async def _render_students_page(target_message: Message, page: int = 0) -> None:
     )
 
 
+MEDIA_EMOJI = {
+    "photo": "📷 Фото",
+    "document": "📄 Документ",
+    "voice": "🎤 Голосове",
+    "audio": "🎵 Аудіо",
+    "video": "🎬 Відео",
+}
+
+
 async def _render_history_page(
         target_message: Message,
         student_id: int,
-        page: int = 0,) -> None:
+        page: int = 0,
+) -> None:
     """
     Малює сторінку історії з конкретним учнем + інлайн-пагінацію.
     """
@@ -253,7 +485,8 @@ async def _render_history_page(
         total_msgs = count_res.scalar() or 0
 
         if total_msgs == 0:
-            await target_message.edit_text(
+            await safe_edit_message(
+                target_message,
                 "Історія для цього користувача порожня.",
                 reply_markup=None,
             )
@@ -296,23 +529,17 @@ async def _render_history_page(
 
     for m in msgs:
         ts = _format_dt(m.created_at)
-        direction = (
-            "Учень → Вчитель"
-            if m.direction == "student_to_teacher"
-            else "Вчитель → Учень"
-        )
+        direction = "Учень → Вчитель" if m.direction == "student_to_teacher" else "Вчитель → Учень"
         prefix = f"[{ts}] {direction}"
 
-        parts: list[str] = []
-
+        body = m.text or ""
         if m.has_media:
-            # простий маркер, що в цьому місці було медіа
-            parts.append("[Медіа]")
-
-        if m.text:
-            parts.append(m.text)
-
-        body = "\n".join(parts) if parts else ""
+            kind = getattr(m, "media_kind", None)
+            body_media = MEDIA_EMOJI.get(kind, "📎 Медіа")
+            if body:
+                body = f"{body}\n{body_media}"
+            else:
+                body = body_media
 
         lines.append(f"{prefix}\n{body}\n")
 
@@ -334,18 +561,23 @@ async def _render_history_page(
             callback_data=f"hist:{student_id}:{page + 1}",
         )
 
-    # Кнопка назад до списку учнів (на першу сторінку)
+    # Кнопки
     kb.button(
         text="⬅️ Назад до списку учнів",
         callback_data="stud_page:0",
     )
-
+    kb.button(
+        text="📎 Показати медіа зі сторінки",
+        callback_data=f"hist_media:{student_id}:{page}",
+    )
     kb.adjust(1)
 
-    await target_message.edit_text(
+    await safe_edit_message(
+        target_message,
         text or "Немає текстових повідомлень.",
         reply_markup=kb.as_markup(),
     )
+
 
 
 async def _render_assign_group_page(
@@ -472,26 +704,23 @@ async def admin_students_page_callback(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("hist:"))
 async def admin_history_callback(callback: CallbackQuery):
-    """
-    Обробка кліку по інлайн-кнопці з /students та пагінації історії.
-    data: hist:<student_id>:<page> або hist:<student_id> (тоді сторінка 0)
-    """
     if not callback.from_user or not (
         await is_admin(callback.from_user.id) or await is_teacher(callback.from_user.id)
     ):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
 
-    data = callback.data or ""
     try:
-        parts = data.split(":")
-        student_id = int(parts[1])
-        page = int(parts[2]) if len(parts) >= 3 else 0
+        _, raw_student_id, raw_page = (callback.data or "").split(":", 2)
+        student_id = int(raw_student_id)
+        page = int(raw_page)
     except Exception:
-        await callback.answer("Некоректні дані кнопки.", show_alert=True)
+        await callback.answer("Некоректні дані.", show_alert=True)
         return
 
-    await _render_history_page(callback.message, student_id=student_id, page=page)
+    target = await callback.message.answer("Завантажую історію...")
+
+    await _render_history_page(target, student_id=student_id, page=page)
     await callback.answer()
 
 
@@ -523,7 +752,6 @@ async def admin_groups(message: Message):
         lines.append(f"{group.id}: {group.name} — вчитель: {teacher_info}")
 
     await message.answer("\n".join(lines))
-
 
 
 @router.message(F.text.startswith("/add_group"))
@@ -1218,6 +1446,7 @@ async def admin_remove_admin(message: Message):
         f"Користувача {admin_user.display_name or admin_user.id} більше не вважаємо 'admin'."
     )
 
+
 @router.message(F.text.startswith("/assign_teacher"))
 async def admin_assign_teacher_1to1(message: Message):
     """
@@ -1397,4 +1626,907 @@ async def admin_unassign_teacher_1to1(message: Message):
 
         await message.answer(
             f"Для учня {student.display_name or student.id} скасовано привʼязку 1-на-1."
+        )
+
+
+async def _render_teachers_page(target_message: Message, page: int = 0) -> None:
+    async with AsyncSessionLocal() as session:
+        count_res = await session.execute(
+            select(func.count(User.id)).where(User.role == "teacher")
+        )
+        total = count_res.scalar() or 0
+
+        if total == 0:
+            await target_message.edit_text("Викладачів поки немає.", reply_markup=None)
+            return
+
+        total_pages = (total + TEACHERS_PER_PAGE - 1) // TEACHERS_PER_PAGE
+        page = max(0, min(page, total_pages - 1))
+        offset = page * TEACHERS_PER_PAGE
+
+        # Беремо викладачів + рахуємо їх учнів (1-на-1 та групи)
+        teachers_res = await session.execute(
+            select(User)
+            .where(User.role == "teacher")
+            .order_by(User.display_name)
+            .offset(offset)
+            .limit(TEACHERS_PER_PAGE)
+        )
+        teachers = teachers_res.scalars().all()
+
+        # Підрахунок учнів на кожного (активні+неактивні)
+        # 1) assigned_teacher_id
+        assigned_counts = dict(
+            (await session.execute(
+                select(User.assigned_teacher_id, func.count(User.id))
+                .where(User.role == "student", User.assigned_teacher_id.is_not(None))
+                .group_by(User.assigned_teacher_id)
+            )).all()
+        )
+
+        # 2) групи (Group.teacher_id -> User.group_id)
+        group_counts = dict(
+            (await session.execute(
+                select(Group.teacher_id, func.count(User.id))
+                .join(User, User.group_id == Group.id)
+                .where(User.role == "student", Group.teacher_id.is_not(None))
+                .group_by(Group.teacher_id)
+            )).all()
+        )
+
+    kb = InlineKeyboardBuilder()
+    for t in teachers:
+        cnt = (assigned_counts.get(t.id, 0) or 0) + (group_counts.get(t.id, 0) or 0)
+        kb.button(
+            text=f"{_sname(t)} — {cnt} учні",
+            callback_data=f"tch:{t.id}:0",  # teacher students page 0
+        )
+    kb.adjust(1)
+
+    # pagination
+    if page > 0:
+        kb.button(text="⬅️ Назад", callback_data=f"tch_page:{page - 1}")
+    if page < total_pages - 1:
+        kb.button(text="➡️ Далі", callback_data=f"tch_page:{page + 1}")
+    kb.adjust(1)
+
+    await target_message.edit_text(
+        f"Викладачі (сторінка {page + 1}/{total_pages}):",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.message(F.text == "/teachers")
+async def admin_teachers(message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+
+    sent = await message.answer("Завантаження списку викладачів...")
+    await _render_teachers_page(sent, page=0)
+
+
+@router.callback_query(F.data.startswith("tch:"))
+async def admin_teacher_students(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    try:
+        _, raw_teacher_id, raw_page = callback.data.split(":", 2)
+        teacher_id = int(raw_teacher_id)
+        page = int(raw_page)
+    except Exception:
+        await callback.answer("Помилка.", show_alert=True)
+        return
+
+    await _render_teacher_students_page(callback.message, teacher_id=teacher_id, page=page)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("t_page:"))
+async def admin_teachers_page(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+
+    page = int(callback.data.split(":")[1])
+    await _render_teachers_page(callback.message, page)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tch_page:"))
+async def admin_teachers_page(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    try:
+        _, raw = callback.data.split(":", 1)
+        page = int(raw)
+    except Exception:
+        await callback.answer("Помилка.", show_alert=True)
+        return
+
+    await _render_teachers_page(callback.message, page=page)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("t_students:"))
+async def admin_teacher_students(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+
+    # t_students:<teacher_id>:<students_page>:<teachers_page>
+    parts = (callback.data or "").split(":")
+    if len(parts) < 4:
+        await callback.answer("Некоректні дані.", show_alert=True)
+        return
+
+    _, teacher_id, page, back_page = parts
+    teacher_id = int(teacher_id)
+    page = int(page)
+    back_page = int(back_page)
+
+    async with AsyncSessionLocal() as session:
+        teacher = await session.get(User, teacher_id)
+        if not teacher:
+            await callback.answer("Викладача не знайдено", show_alert=True)
+            return
+
+        total = await session.scalar(
+            select(func.count(User.id)).where(User.assigned_teacher_id == teacher_id)
+        ) or 0
+
+        pages = max(1, (total + STUDENTS_PER_PAGE - 1) // STUDENTS_PER_PAGE)
+        page = max(0, min(page, pages - 1))
+
+        res = await session.execute(
+            select(User)
+            .where(User.assigned_teacher_id == teacher_id)
+            .order_by(User.display_name)
+            .offset(page * STUDENTS_PER_PAGE)
+            .limit(STUDENTS_PER_PAGE)
+        )
+        students = res.scalars().all()
+
+    kb = InlineKeyboardBuilder()
+
+    title = teacher.display_name or str(teacher.id)
+    lines = [
+        f"👨‍🏫 {title}",
+        f"Учні ({page + 1}/{pages}):",
+        "",
+    ]
+
+    for s in students:
+        name = s.display_name or "—"
+        lines.append(f"• {name} (ID {s.id})")
+
+        # кнопка видалення цього студента
+        kb.button(
+            text=f"🗑 Видалити: {name}",
+            callback_data=f"stud_del:{s.id}:{teacher_id}:{page}:{back_page}",
+        )
+
+    # Пагінація учнів
+    if page > 0:
+        kb.button(text="⬅️", callback_data=f"t_students:{teacher_id}:{page - 1}:{back_page}")
+    if page < pages - 1:
+        kb.button(text="➡️", callback_data=f"t_students:{teacher_id}:{page + 1}:{back_page}")
+
+    # Назад до списку викладачів на ту ж сторінку
+    kb.button(text="⬅️ Назад", callback_data=f"t_back:{back_page}")
+
+    kb.adjust(1)
+
+    await callback.message.edit_text("\n".join(lines), reply_markup=kb.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("stud_del:"))
+async def admin_student_delete_confirm(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+
+    # stud_del:<student_id>:<teacher_id>:<students_page>:<teachers_back_page>
+    parts = (callback.data or "").split(":")
+    if len(parts) < 5:
+        await callback.answer("Некоректні дані.", show_alert=True)
+        return
+
+    _, student_id, teacher_id, page, back_page = parts
+    student_id = int(student_id)
+    teacher_id = int(teacher_id)
+    page = int(page)
+    back_page = int(back_page)
+
+    async with AsyncSessionLocal() as session:
+        student = await session.get(User, student_id)
+
+    if not student:
+        await callback.answer("Учня не знайдено.", show_alert=True)
+        return
+
+    name = student.display_name or str(student.id)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Так, видалити", callback_data=f"stud_del_ok:{student_id}:{teacher_id}:{page}:{back_page}")
+    kb.button(text="❌ Скасувати", callback_data=f"t_students:{teacher_id}:{page}:{back_page}")
+    kb.adjust(1)
+
+    await callback.message.edit_text(
+        f"⚠️ Видалити учня **{name}** (ID {student.id}) з бази?\n"
+        f"Це прибере його історію та привʼязки.",
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("stud_del_ok:"))
+async def admin_student_delete_do(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+
+    # stud_del_ok:<student_id>:<teacher_id>:<students_page>:<teachers_back_page>
+    parts = (callback.data or "").split(":")
+    if len(parts) < 5:
+        await callback.answer("Некоректні дані.", show_alert=True)
+        return
+
+    _, student_id, teacher_id, page, back_page = parts
+    student_id = int(student_id)
+    teacher_id = int(teacher_id)
+    page = int(page)
+    back_page = int(back_page)
+
+    async with AsyncSessionLocal() as session:
+        # 1) прибираємо лінки reply->student
+        await session.execute(
+            delete(TeacherMessageLink).where(TeacherMessageLink.student_id == student_id)
+        )
+        # 2) прибираємо повідомлення
+        await session.execute(
+            delete(DbMessage).where(
+                (DbMessage.from_user_id == student_id) | (DbMessage.to_user_id == student_id)
+            )
+        )
+        # 3) видаляємо самого користувача
+        student = await session.get(User, student_id)
+        if student:
+            await session.delete(student)
+
+        await session.commit()
+
+    await callback.answer("✅ Учня видалено.", show_alert=True)
+
+    # Повертаємось до списку учнів викладача
+    await admin_teacher_students(
+        CallbackQuery(
+            id=callback.id,
+            from_user=callback.from_user,
+            chat_instance=callback.chat_instance,
+            message=callback.message,
+            data=f"t_students:{teacher_id}:{page}:{back_page}",
+        )
+    )
+
+
+@router.callback_query(F.data.startswith("t_back:"))
+async def admin_teachers_back(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+
+    back_page = int((callback.data or "").split(":")[1])
+    await _render_teachers_page(callback.message, page=back_page)
+    await callback.answer()
+
+
+# =========================
+# /admins (admin) + pagination
+# =========================
+
+async def _render_admins_page(target_message: Message, page: int = 0) -> None:
+    async with AsyncSessionLocal() as session:
+        count_res = await session.execute(
+            select(func.count(User.id)).where(User.role == "admin")
+        )
+        total = count_res.scalar() or 0
+
+        if total == 0:
+            await target_message.edit_text("Адмінів поки немає.", reply_markup=None)
+            return
+
+        total_pages = (total + ADMINS_PER_PAGE - 1) // ADMINS_PER_PAGE
+        page = max(0, min(page, total_pages - 1))
+        offset = page * ADMINS_PER_PAGE
+
+        res = await session.execute(
+            select(User)
+            .where(User.role == "admin")
+            .order_by(User.display_name)
+            .offset(offset)
+            .limit(ADMINS_PER_PAGE)
+        )
+        admins = res.scalars().all()
+
+    lines = [f"🛡 Адміни (сторінка {page + 1}/{total_pages}):", ""]
+    for a in admins:
+        lines.append(f"• {a.display_name or '—'} — {a.id}")
+
+    kb = InlineKeyboardBuilder()
+    if page > 0:
+        kb.button(text="⬅️", callback_data=f"adm_page:{page - 1}")
+    if page < total_pages - 1:
+        kb.button(text="➡️", callback_data=f"adm_page:{page + 1}")
+    kb.adjust(2)
+
+    await target_message.edit_text("\n".join(lines), reply_markup=kb.as_markup())
+
+
+@router.message(F.text.startswith("/admins"))
+async def admin_admins(message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+    sent = await message.answer("Завантаження адмінів...")
+    await _render_admins_page(sent, page=0)
+
+
+@router.callback_query(F.data.startswith("adm_page:"))
+async def admin_admins_page_callback(callback: CallbackQuery):
+    if not callback.from_user or not await is_admin(callback.from_user.id):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    try:
+        _, raw_page = (callback.data or "").split(":", 1)
+        page = int(raw_page)
+    except Exception:
+        await callback.answer("Помилка пагінації.", show_alert=True)
+        return
+
+    await _render_admins_page(callback.message, page=page)
+    await callback.answer()
+
+
+# =========================
+# /delete_student (admin) + confirm + pagination
+# =========================
+
+async def _render_delete_students_page(target_message: Message, page: int = 0) -> None:
+    async with AsyncSessionLocal() as session:
+        count_res = await session.execute(
+            select(func.count(User.id)).where(User.role == "student")
+        )
+        total = count_res.scalar() or 0
+
+        if total == 0:
+            await target_message.edit_text("Студентів поки немає.", reply_markup=None)
+            return
+
+        total_pages = (total + DEL_STUDENTS_PER_PAGE - 1) // DEL_STUDENTS_PER_PAGE
+        page = max(0, min(page, total_pages - 1))
+        offset = page * DEL_STUDENTS_PER_PAGE
+
+        res = await session.execute(
+            select(User)
+            .where(User.role == "student")
+            .order_by(User.display_name)
+            .offset(offset)
+            .limit(DEL_STUDENTS_PER_PAGE)
+        )
+        students = res.scalars().all()
+
+    kb = InlineKeyboardBuilder()
+    for s in students:
+        name = s.display_name or f"ID {s.id}"
+        kb.button(text=f"🗑 {name}", callback_data=f"delstud:{s.id}:{page}")
+    kb.adjust(1)
+
+    if page > 0:
+        kb.button(text="⬅️", callback_data=f"delstud_page:{page - 1}")
+    if page < total_pages - 1:
+        kb.button(text="➡️", callback_data=f"delstud_page:{page + 1}")
+    kb.adjust(1, 2)
+
+    header = f"🗑 Видалення студента (сторінка {page + 1}/{total_pages}).\nОбери кого видалити:"
+    await target_message.edit_text(header, reply_markup=kb.as_markup())
+
+
+@router.message(F.text.startswith("/delete_student"))
+async def admin_delete_student(message: Message):
+    """
+    /delete_student
+    /delete_student <ім'я або id>
+
+    Якщо без параметрів — дає список з кнопками і підтвердженням.
+    """
+    if not await is_admin(message.from_user.id):
+        return
+
+    parts = message.text.split(maxsplit=1)
+
+    # режим зі списком
+    if len(parts) == 1:
+        sent = await message.answer("Завантаження студентів...")
+        await _render_delete_students_page(sent, page=0)
+        return
+
+    identifier = parts[1]
+
+    async with AsyncSessionLocal() as session:
+        students = await _find_students_by_identifier(session, identifier)
+        if not students:
+            await message.answer("Студента з таким ім'ям або id не знайдено.")
+            return
+        if len(students) > 1:
+            lines = ["Знайдено кілька студентів:"]
+            for s in students:
+                lines.append(f"{s.display_name or '—'} — {s.id}")
+            lines.append("Уточни, будь ласка, за ID або повним ім'ям.")
+            await message.answer("\n".join(lines))
+            return
+        student = students[0]
+
+    # підтвердження
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Так, видалити", callback_data=f"delstud_ok:{student.id}")
+    kb.button(text="❌ Скасувати", callback_data="delstud_cancel")
+    kb.adjust(1, 1)
+
+    await message.answer(
+        f"Підтверди видалення студента:\n"
+        f"• {student.display_name or '—'} — {student.id}\n\n"
+        f"⚠️ Будуть видалені також його повідомлення та зв'язки.",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("delstud_page:"))
+async def admin_delete_students_page_callback(callback: CallbackQuery):
+    if not callback.from_user or not await is_admin(callback.from_user.id):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    try:
+        _, raw_page = (callback.data or "").split(":", 1)
+        page = int(raw_page)
+    except Exception:
+        await callback.answer("Помилка пагінації.", show_alert=True)
+        return
+
+    await _render_delete_students_page(callback.message, page=page)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("delstud:"))
+async def admin_delete_student_pick(callback: CallbackQuery):
+    """
+    Клік по студенту зі списку на видалення.
+    data: delstud:<student_id>:<page>
+    """
+    if not callback.from_user or not await is_admin(callback.from_user.id):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+
+    try:
+        _, raw_sid, raw_page = (callback.data or "").split(":", 2)
+        student_id = int(raw_sid)
+        page = int(raw_page)
+    except Exception:
+        await callback.answer("Некоректні дані.", show_alert=True)
+        return
+
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(select(User).where(User.id == student_id, User.role == "student"))
+        student = res.scalar_one_or_none()
+
+    if not student:
+        await callback.answer("Студента не знайдено.", show_alert=True)
+        # оновимо список
+        await _render_delete_students_page(callback.message, page=page)
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Так, видалити", callback_data=f"delstud_ok:{student.id}")
+    kb.button(text="⬅️ Назад", callback_data=f"delstud_page:{page}")
+    kb.adjust(1, 1)
+
+    await callback.message.edit_text(
+        f"Підтверди видалення студента:\n"
+        f"• {student.display_name or '—'} — {student.id}\n\n"
+        f"⚠️ Будуть видалені також його повідомлення та зв'язки.",
+        reply_markup=kb.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("delstud_ok:"))
+async def admin_delete_student_confirm(callback: CallbackQuery):
+    if not callback.from_user or not await is_admin(callback.from_user.id):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+
+    try:
+        _, raw_sid = (callback.data or "").split(":", 1)
+        student_id = int(raw_sid)
+    except Exception:
+        await callback.answer("Некоректні дані.", show_alert=True)
+        return
+
+    async with AsyncSessionLocal() as session:
+        # студент
+        res = await session.execute(select(User).where(User.id == student_id, User.role == "student"))
+        student = res.scalar_one_or_none()
+        if not student:
+            await callback.message.edit_text("Студента вже немає в базі.", reply_markup=None)
+            await callback.answer()
+            return
+
+        # чистимо зв'язки
+        await session.execute(
+            delete(TeacherMessageLink).where(TeacherMessageLink.student_id == student_id)
+        )
+        await session.execute(
+            delete(DbMessage).where(
+                (DbMessage.from_user_id == student_id) | (DbMessage.to_user_id == student_id)
+            )
+        )
+
+        # прибираємо прив'язки (на всяк випадок)
+        student.group_id = None
+        student.assigned_teacher_id = None
+
+        # видаляємо user
+        await session.delete(student)
+        await session.commit()
+
+    await callback.message.edit_text(f"✅ Студента {student_id} видалено.", reply_markup=None)
+    await callback.answer("Готово.")
+
+
+@router.callback_query(F.data == "delstud_cancel")
+async def admin_delete_student_cancel(callback: CallbackQuery):
+    if not callback.from_user or not await is_admin(callback.from_user.id):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    await callback.message.edit_text("Скасовано.", reply_markup=None)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("stu:"))
+async def admin_student_card(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    try:
+        _, raw_teacher_id, raw_student_id, raw_page = callback.data.split(":", 3)
+        teacher_id = int(raw_teacher_id)
+        student_id = int(raw_student_id)
+        page = int(raw_page)
+    except Exception:
+        await callback.answer("Помилка.", show_alert=True)
+        return
+
+    async with AsyncSessionLocal() as session:
+        student = (await session.execute(
+            select(User).where(User.id == student_id, User.role == "student")
+        )).scalar_one_or_none()
+
+    if not student:
+        await callback.answer("Учня не знайдено.", show_alert=True)
+        return
+
+    kb = InlineKeyboardBuilder()
+
+    if student.is_active:
+        kb.button(text="🔴 Деактивувати", callback_data=f"stu_toggle:{teacher_id}:{student_id}:{page}:0")
+    else:
+        kb.button(text="🟢 Активувати", callback_data=f"stu_toggle:{teacher_id}:{student_id}:{page}:1")
+
+    kb.button(text="⬅️ Назад", callback_data=f"tch:{teacher_id}:{page}")
+    kb.adjust(1)
+
+    await callback.message.edit_text(
+        f"👤 {_sname(student)}\n"
+        f"ID: {student.id}\n"
+        f"Статус: {'active' if student.is_active else 'inactive'}",
+        reply_markup=kb.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("stu_toggle:"))
+async def admin_student_toggle(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    try:
+        _, raw_teacher_id, raw_student_id, raw_page, raw_set = callback.data.split(":", 4)
+        teacher_id = int(raw_teacher_id)
+        student_id = int(raw_student_id)
+        page = int(raw_page)
+        set_val = int(raw_set)  # 0/1
+    except Exception:
+        await callback.answer("Помилка.", show_alert=True)
+        return
+
+    async with AsyncSessionLocal() as session:
+        student = (await session.execute(
+            select(User).where(User.id == student_id, User.role == "student")
+        )).scalar_one_or_none()
+
+        if not student:
+            await callback.answer("Учня не знайдено.", show_alert=True)
+            return
+
+        student.is_active = bool(set_val)
+        await session.commit()
+
+    # Повертаємо назад у список учнів викладача (щоб одразу було видно 🟢/🔴)
+    await _render_teacher_students_page(callback.message, teacher_id=teacher_id, page=page)
+    await callback.answer("Ок")
+
+
+# =========================
+# /unassigned_students
+# =========================
+@router.message(F.text.startswith("/unassigned_students"))
+async def admin_unassigned_students(message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+    sent = await message.answer("Завантаження...")
+    await _render_unassigned_students_page(sent, page=0)
+
+
+async def _render_unassigned_students_page(target_message: Message, page: int = 0) -> None:
+    async with AsyncSessionLocal() as session:
+        # "без назначенного учителя":
+        # немає assigned_teacher_id
+        # і група або відсутня, або в групи нема teacher_id
+        q = (
+            select(User)
+            .outerjoin(Group, User.group_id == Group.id)
+            .where(
+                User.role == "student",
+                User.assigned_teacher_id.is_(None),
+                (User.group_id.is_(None) | (Group.teacher_id.is_(None))),
+            )
+        )
+
+        count_res = await session.execute(select(func.count()).select_from(q.subquery()))
+        total = count_res.scalar() or 0
+
+        if total == 0:
+            await target_message.edit_text("Немає студентів без призначеного викладача.", reply_markup=None)
+            return
+
+        total_pages = (total + UNASSIGNED_PER_PAGE - 1) // UNASSIGNED_PER_PAGE
+        page = max(0, min(page, total_pages - 1))
+        offset = page * UNASSIGNED_PER_PAGE
+
+        students = (await session.execute(
+            q.order_by(User.display_name).offset(offset).limit(UNASSIGNED_PER_PAGE)
+        )).scalars().all()
+
+    kb = InlineKeyboardBuilder()
+    # просто список + щоб можна було копіювати ID (в тексті)
+    lines = [f"Студенти без призначеного викладача (сторінка {page + 1}/{total_pages}):", ""]
+    for s in students:
+        lines.append(f"• {_status_emoji(s.is_active)} {_sname(s)} (ID {s.id})")
+
+    if page > 0:
+        kb.button(text="⬅️ Назад", callback_data=f"unass_page:{page - 1}")
+    if page < total_pages - 1:
+        kb.button(text="➡️ Далі", callback_data=f"unass_page:{page + 1}")
+    kb.adjust(1)
+
+    await target_message.edit_text("\n".join(lines), reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("unass_page:"))
+async def admin_unassigned_students_page(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    try:
+        _, raw = callback.data.split(":", 1)
+        page = int(raw)
+    except Exception:
+        await callback.answer("Помилка.", show_alert=True)
+        return
+
+    await _render_unassigned_students_page(callback.message, page=page)
+    await callback.answer()
+
+
+@router.message(F.text.startswith("/deactivate_student"))
+async def admin_deactivate_student(message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+
+    # без параметра → показуємо список
+    if len(parts) == 1:
+        sent = await message.answer("Завантаження списку студентів...")
+        await _render_students_toggle_page(sent, page=0)
+        return
+
+    q = parts[1].strip()
+    async with AsyncSessionLocal() as session:
+        candidates = await _find_students_by_query(session, q)
+
+    if not candidates:
+        await message.answer("Студента не знайдено.")
+        return
+
+    if len(candidates) > 1:
+        lines = ["Знайдено кілька студентів, уточніть (краще ID):"]
+        for s in candidates[:20]:
+            status = "active" if getattr(s, "is_active", True) else "inactive"
+            lines.append(f"• {s.display_name or '—'} — {s.id} ({status})")
+        await message.answer("\n".join(lines))
+        return
+
+    st = candidates[0]
+    ok, name = await _set_student_active(st.id, False)
+    await message.answer(("🛑 Деактивовано: " + name) if ok else name)
+
+
+@router.message(F.text.startswith("/activate_student"))
+async def admin_activate_student(message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+
+    # без параметра → показуємо список
+    if len(parts) == 1:
+        sent = await message.answer("Завантаження списку студентів...")
+        await _render_students_toggle_page(sent, page=0)
+        return
+
+    q = parts[1].strip()
+    async with AsyncSessionLocal() as session:
+        candidates = await _find_students_by_query(session, q)
+
+    if not candidates:
+        await message.answer("Студента не знайдено.")
+        return
+
+    if len(candidates) > 1:
+        lines = ["Знайдено кілька студентів, уточніть (краще ID):"]
+        for s in candidates[:20]:
+            status = "active" if getattr(s, "is_active", True) else "inactive"
+            lines.append(f"• {s.display_name or '—'} — {s.id} ({status})")
+        await message.answer("\n".join(lines))
+        return
+
+    st = candidates[0]
+    ok, name = await _set_student_active(st.id, True)
+    await message.answer(("✅ Активовано: " + name) if ok else name)
+
+
+@router.callback_query(F.data.startswith("stu_page:"))
+async def admin_students_toggle_page(callback: CallbackQuery):
+    if not callback.from_user or not await is_admin(callback.from_user.id):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+
+    try:
+        _, raw_page = (callback.data or "").split(":", 1)
+        page = int(raw_page)
+    except Exception:
+        await callback.answer("Помилка пагінації.", show_alert=True)
+        return
+
+    await _render_students_toggle_page(callback.message, page=page)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("stu_deact:"))
+async def admin_deactivate_student_cb(callback: CallbackQuery):
+    if not callback.from_user or not await is_admin(callback.from_user.id):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+
+    try:
+        _, raw_id, raw_page = (callback.data or "").split(":", 2)
+        student_id = int(raw_id)
+        page = int(raw_page)
+    except Exception:
+        await callback.answer("Некоректні дані.", show_alert=True)
+        return
+
+    ok, name = await _set_student_active(student_id, False)
+    await callback.answer(("🛑 Деактивовано: " + name) if ok else name, show_alert=not ok)
+    await _render_students_toggle_page(callback.message, page=page)
+
+
+@router.callback_query(F.data.startswith("stu_act:"))
+async def admin_activate_student_cb(callback: CallbackQuery):
+    if not callback.from_user or not await is_admin(callback.from_user.id):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+
+    try:
+        _, raw_id, raw_page = (callback.data or "").split(":", 2)
+        student_id = int(raw_id)
+        page = int(raw_page)
+    except Exception:
+        await callback.answer("Некоректні дані.", show_alert=True)
+        return
+
+    ok, name = await _set_student_active(student_id, True)
+    await callback.answer(("✅ Активовано: " + name) if ok else name, show_alert=not ok)
+    await _render_students_toggle_page(callback.message, page=page)
+
+
+def format_media_footer(m: DbMessage) -> str:
+    dt = m.created_at.strftime("%d.%m %H:%M")
+    direction = (
+        "Учень → Вчитель"
+        if m.direction == "student_to_teacher"
+        else "Вчитель → Учень"
+    )
+    return f"[{dt}] {direction}"
+
+
+@router.callback_query(F.data.startswith("hist_media:"))
+async def admin_history_media_callback(callback: CallbackQuery):
+    if not callback.from_user or not (
+            await is_admin(callback.from_user.id) or await is_teacher(callback.from_user.id)
+    ):
+        await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+
+    try:
+        _, raw_student_id, raw_page = (callback.data or "").split(":", 2)
+        student_id = int(raw_student_id)
+        page = int(raw_page)
+    except Exception:
+        await callback.answer("Некоректні дані.", show_alert=True)
+        return
+
+    async with AsyncSessionLocal() as session:
+        offset = page * MSGS_PER_PAGE
+        res = await session.execute(
+            select(DbMessage)
+            .where(
+                (DbMessage.from_user_id == student_id)
+                | (DbMessage.to_user_id == student_id)
+            )
+            .order_by(DbMessage.created_at)
+            .offset(offset)
+            .limit(MSGS_PER_PAGE)
+        )
+        msgs = res.scalars().all()
+
+    media_msgs = [m for m in msgs if m.has_media and m.media_file_id]
+    if not media_msgs:
+        await callback.answer("На цій сторінці немає медіа.", show_alert=True)
+        return
+
+    await callback.answer(f"Надсилаю медіа: {len(media_msgs)} шт.", show_alert=False)
+
+    for m in media_msgs[:10]:
+        kind = getattr(m, "media_kind", None)
+        caption = (m.text or "")[:900] or MEDIA_EMOJI.get(kind, "📎 Медіа")
+
+        if kind == "photo":
+            await callback.bot.send_photo(callback.from_user.id, m.media_file_id, caption=caption)
+        elif kind == "document":
+            await callback.bot.send_document(callback.from_user.id, m.media_file_id, caption=caption)
+        elif kind == "voice":
+            await callback.bot.send_voice(callback.from_user.id, m.media_file_id)
+        elif kind == "audio":
+            await callback.bot.send_audio(callback.from_user.id, m.media_file_id, caption=caption)
+        elif kind == "video":
+            await callback.bot.send_video(callback.from_user.id, m.media_file_id, caption=caption)
+        else:
+            await callback.bot.send_message(
+                callback.from_user.id,
+                f"📎 Медіа: {caption}"
+            )
+
+        # ✅ ОЦЕ ГОЛОВНЕ — підпис ПІД медіа
+        await callback.bot.send_message(
+            callback.from_user.id,
+            format_media_footer(m)
         )

@@ -35,43 +35,34 @@ class Group(Base):
     )
 
 
+
 class User(Base):
     __tablename__ = "users"
 
     id = Column(BigInteger, primary_key=True)  # telegram user_id
-    role = Column(String(20), nullable=False, default="student")  # student/teacher/admin
+    role = Column(String(20), nullable=False, default="student")
     display_name = Column(String(255), nullable=True)
 
-    # До якої групи належить учень
-    group_id = Column(Integer, ForeignKey("groups.id"), nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
 
-    # Прямий викладач (1-на-1)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=True)
+    group = relationship("Group", back_populates="students", foreign_keys=[group_id])
+
+    # ✅ 1-на-1: учень -> викладач
     assigned_teacher_id = Column(BigInteger, ForeignKey("users.id"), nullable=True)
 
-    # Група учня – ТУТ додаємо foreign_keys, щоб зняти двозначність
-    group = relationship(
-        "Group",
-        back_populates="students",
-        foreign_keys=[group_id],
-    )
-
-    # Self-FK: student.assigned_teacher → User (teacher)
     assigned_teacher = relationship(
         "User",
         foreign_keys=[assigned_teacher_id],
-        remote_side=[id],            # вказуємо, що посилаємось на User.id
-        backref="assigned_students", # teacher.assigned_students – список студентів 1-на-1
+        remote_side=[id],                 # ✅ ключовий фікс
+        back_populates="assigned_students",
     )
 
-    messages_from = relationship(
-        "Message",
-        back_populates="from_user",
-        foreign_keys="Message.from_user_id",
-    )
-    messages_to = relationship(
-        "Message",
-        back_populates="to_user",
-        foreign_keys="Message.to_user_id",
+    # ✅ викладач -> список учнів
+    assigned_students = relationship(
+        "User",
+        foreign_keys=[assigned_teacher_id],
+        back_populates="assigned_teacher",
     )
 
 
@@ -91,6 +82,7 @@ class Message(Base):
 
     from_user = relationship("User", foreign_keys=[from_user_id])
     to_user = relationship("User", foreign_keys=[to_user_id])
+    media_kind = Column(String(16), nullable=True)
 
 
 class TeacherMessageLink(Base):

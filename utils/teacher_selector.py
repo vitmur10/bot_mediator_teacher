@@ -41,3 +41,5 @@ async def select_teacher_for_student(student: User) -> int:
             return row[0]
 
     raise RuntimeError("Teacher is not configured")
+
+
