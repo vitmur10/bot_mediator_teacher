@@ -17,4 +17,4 @@ async def cmd_start(message: Message):
         role = "student"
 
     await get_or_create_user(message.from_user, role=role)
-    await message.answer("Бот-посередник готовий до роботи.")
+    await message.answer(f"""👋 Привіт!\nЦе чат для спілкування з твоїм викладачем Ecole.\nПросто напиши повідомлення — можна текстом або голосом 💛""")
