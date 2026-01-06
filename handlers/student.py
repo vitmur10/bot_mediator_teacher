@@ -73,7 +73,7 @@ async def student_message(message: Message):
     kb = InlineKeyboardBuilder()
     kb.button(
         text="📜 Історія з цим учнем",
-        callback_data=f"hist:{student.id}:0",
+        callback_data=f"hist:{student.id}:-1",
     )
     kb.adjust(1)
 

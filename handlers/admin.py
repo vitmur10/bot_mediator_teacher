@@ -427,7 +427,7 @@ async def _render_students_page(target_message: Message, page: int = 0) -> None:
         # При кліку відкриваємо історію учня, перша сторінка (0)
         kb.button(
             text=name,
-            callback_data=f"hist:{u.id}:0",
+            callback_data=f"hist:{u.id}:-1",
         )
 
     kb.adjust(1)
@@ -466,16 +466,8 @@ MEDIA_EMOJI = {
 }
 
 
-async def _render_history_page(
-        target_message: Message,
-        student_id: int,
-        page: int = 0,
-) -> None:
-    """
-    Малює сторінку історії з конкретним учнем + інлайн-пагінацію.
-    """
+async def _render_history_page(target_message: Message, student_id: int, page: int = -1) -> None:
     async with AsyncSessionLocal() as session:
-        # рахуємо кількість повідомлень
         count_res = await session.execute(
             select(func.count(DbMessage.id)).where(
                 (DbMessage.from_user_id == student_id)
@@ -485,14 +477,15 @@ async def _render_history_page(
         total_msgs = count_res.scalar() or 0
 
         if total_msgs == 0:
-            await safe_edit_message(
-                target_message,
-                "Історія для цього користувача порожня.",
-                reply_markup=None,
-            )
+            await target_message.edit_text("Історія для цього користувача порожня.", reply_markup=None)
             return
 
         total_pages = (total_msgs + MSGS_PER_PAGE - 1) // MSGS_PER_PAGE
+
+        # ✅ якщо відкриття "історії" — показуємо найновіші
+        if page == -1:
+            page = total_pages - 1
+
         if page < 0:
             page = 0
         if page >= total_pages:
@@ -506,24 +499,20 @@ async def _render_history_page(
                 (DbMessage.from_user_id == student_id)
                 | (DbMessage.to_user_id == student_id)
             )
-            .order_by(DbMessage.created_at)
+            .order_by(DbMessage.created_at)  # ASC, щоб всередині сторінки було як в чаті
             .offset(offset)
             .limit(MSGS_PER_PAGE)
         )
         msgs = res.scalars().all()
 
-        user_res = await session.execute(
-            select(User).where(User.id == student_id)
-        )
+        user_res = await session.execute(select(User).where(User.id == student_id))
         student = user_res.scalar_one_or_none()
 
-    header_name = (
-        student.display_name if student and student.display_name else str(student_id)
-    )
+    header_name = student.display_name if student and student.display_name else str(student_id)
 
-    lines: list[str] = [
+    lines = [
         f"Історія діалогу з учнем: {header_name}",
-        f"Сторінка {page + 1}/{total_pages}",
+        f"Сторінка {page + 1}/{total_pages} (показані найновіші, гортай до старих)",
         "",
     ]
 
@@ -536,10 +525,7 @@ async def _render_history_page(
         if m.has_media:
             kind = getattr(m, "media_kind", None)
             body_media = MEDIA_EMOJI.get(kind, "📎 Медіа")
-            if body:
-                body = f"{body}\n{body_media}"
-            else:
-                body = body_media
+            body = f"{body}\n{body_media}" if body else body_media
 
         lines.append(f"{prefix}\n{body}\n")
 
@@ -549,34 +535,26 @@ async def _render_history_page(
 
     kb = InlineKeyboardBuilder()
 
-    # Пагінація по історії
-    if page > 0:
-        kb.button(
-            text="⬅️ Попередня сторінка",
-            callback_data=f"hist:{student_id}:{page - 1}",
-        )
+    # ✅ Пагінація "як у чаті": від нових до старих
+    # Старіші = page + 1
     if page < total_pages - 1:
         kb.button(
-            text="➡️ Наступна сторінка",
+            text="⬅️ Старіші",
             callback_data=f"hist:{student_id}:{page + 1}",
         )
 
-    # Кнопки
-    kb.button(
-        text="⬅️ Назад до списку учнів",
-        callback_data="stud_page:0",
-    )
-    kb.button(
-        text="📎 Показати медіа зі сторінки",
-        callback_data=f"hist_media:{student_id}:{page}",
-    )
+    # Новіші = page - 1
+    if page > 0:
+        kb.button(
+            text="➡️ Новіші",
+            callback_data=f"hist:{student_id}:{page - 1}",
+        )
+
+    kb.button(text="⬅️ Назад до списку учнів", callback_data="stud_page:0")
+    kb.button(text="📎 Показати медіа зі сторінки", callback_data=f"hist_media:{student_id}:{page}")
     kb.adjust(1)
 
-    await safe_edit_message(
-        target_message,
-        text or "Немає текстових повідомлень.",
-        reply_markup=kb.as_markup(),
-    )
+    await target_message.edit_text(text or "Немає повідомлень.", reply_markup=kb.as_markup())
 
 
 
@@ -718,10 +696,12 @@ async def admin_history_callback(callback: CallbackQuery):
         await callback.answer("Некоректні дані.", show_alert=True)
         return
 
+    # історію завжди шлемо новим повідомленням (як ми домовлялись)
     target = await callback.message.answer("Завантажую історію...")
 
     await _render_history_page(target, student_id=student_id, page=page)
     await callback.answer()
+
 
 
 @router.message(F.text.startswith("/groups"))
