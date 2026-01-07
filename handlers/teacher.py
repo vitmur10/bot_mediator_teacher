@@ -134,53 +134,62 @@ def _extract_media_info(message: Message):
 async def _send_to_student_via_bot(message: Message, student_id: int):
     """
     Відправка повідомлення від вчителя учню з підтримкою медіа.
-    Повертає sent_message.
+    Повертає: (sent_message, text, has_media, media_file_id)
+    БЕЗ media_kind, щоб не чіпати БД.
     """
-    text, has_media, media_file_id, media_kind = _extract_media_info(message)
+    text = message.text or message.caption or ""
+
+    # якщо тексту немає — проставляємо короткий placeholder
+    if not text:
+        if message.voice:
+            text = "🎤 Голосове"
+        elif message.audio:
+            text = "🎵 Аудіо"
+        elif message.video:
+            text = "🎬 Відео"
+        elif message.document:
+            text = "📄 Документ"
+        elif message.photo:
+            text = "📷 Фото"
+
+    has_media = bool(message.photo or message.document or message.voice or message.audio or message.video)
+
+    media_file_id = None
+    media_kind = None  # локально, НЕ повертаємо і НЕ пишемо в БД
+
+    if message.photo:
+        media_file_id = message.photo[-1].file_id
+        media_kind = "photo"
+    elif message.document:
+        media_file_id = message.document.file_id
+        media_kind = "document"
+    elif message.voice:
+        media_file_id = message.voice.file_id
+        media_kind = "voice"
+    elif message.audio:
+        media_file_id = message.audio.file_id
+        media_kind = "audio"
+    elif message.video:
+        media_file_id = message.video.file_id
+        media_kind = "video"
 
     if has_media and media_file_id:
         if media_kind == "photo":
-            sent = await message.bot.send_photo(
-                chat_id=student_id,
-                photo=media_file_id,
-                caption=text or None,
-            )
+            sent = await message.bot.send_photo(chat_id=student_id, photo=media_file_id, caption=text or None)
         elif media_kind == "document":
-            sent = await message.bot.send_document(
-                chat_id=student_id,
-                document=media_file_id,
-                caption=text or None,
-            )
+            sent = await message.bot.send_document(chat_id=student_id, document=media_file_id, caption=text or None)
         elif media_kind == "voice":
-            sent = await message.bot.send_voice(
-                chat_id=student_id,
-                voice=media_file_id,
-                caption=text or None,
-            )
+            sent = await message.bot.send_voice(chat_id=student_id, voice=media_file_id, caption=text or None)
         elif media_kind == "audio":
-            sent = await message.bot.send_audio(
-                chat_id=student_id,
-                audio=media_file_id,
-                caption=text or None,
-            )
+            sent = await message.bot.send_audio(chat_id=student_id, audio=media_file_id, caption=text or None)
         elif media_kind == "video":
-            sent = await message.bot.send_video(
-                chat_id=student_id,
-                video=media_file_id,
-                caption=text or None,
-            )
+            sent = await message.bot.send_video(chat_id=student_id, video=media_file_id, caption=text or None)
         else:
-            sent = await message.bot.send_message(
-                chat_id=student_id,
-                text=text,
-            )
+            sent = await message.bot.send_message(chat_id=student_id, text=text)
     else:
-        sent = await message.bot.send_message(
-            chat_id=student_id,
-            text=text,
-        )
+        sent = await message.bot.send_message(chat_id=student_id, text=text)
 
-    return sent, text, has_media, media_file_id, media_kind
+    return sent, text, has_media, media_file_id
 
 
 @router.message(F.reply_to_message, ~F.text.startswith("/to"))
@@ -388,7 +397,8 @@ async def teacher_free_text_after_to(message: Message, state: FSMContext):
         return
 
     # Якщо це команда або reply — нехай обробляють інші хендлери
-    if message.text and message.text.startswith("/"):
+    # (message.text може бути None, тому перевіряємо обережно)
+    if (message.text or "").startswith("/"):
         return
     if message.reply_to_message:
         return
@@ -396,34 +406,38 @@ async def teacher_free_text_after_to(message: Message, state: FSMContext):
     data = await state.get_data()
     student_id = data.get("to_student_id")
     if not student_id:
-        # на всякий випадок
         await state.clear()
         return
 
     async with AsyncSessionLocal() as session:
-        res_student = await session.execute(select(User).where(User.id == student_id))
+        res_student = await session.execute(
+            select(User).where(User.id == int(student_id))
+        )
         student = res_student.scalar_one_or_none()
         if not student:
             await message.answer("Учня не знайдено в базі.")
             await state.clear()
             return
 
-        sent, text, has_media, media_file_id = await _send_to_student_via_bot(message, student.id)
+        # ВАЖЛИВО: _send_to_student_via_bot має повертати РІВНО 4 значення
+        sent, text, has_media, media_file_id = await _send_to_student_via_bot(
+            message, student.id
+        )
 
-        session.add(DbMessage(
-            from_user_id=message.from_user.id,
-            to_user_id=student.id,
-            direction="teacher_to_student",
-            text=text,
-            has_media=has_media,
-            media_file_id=media_file_id,
-            tg_message_id=sent.message_id,
-        ))
+        session.add(
+            DbMessage(
+                from_user_id=message.from_user.id,
+                to_user_id=student.id,
+                direction="teacher_to_student",
+                text=text,
+                has_media=has_media,
+                media_file_id=media_file_id,
+                tg_message_id=sent.message_id,
+            )
+        )
         await session.commit()
 
     await message.answer(f"Повідомлення надіслано учню: {student.display_name or student.id}")
-
-    # очищаємо стан
     await state.clear()
 
 
