@@ -9,6 +9,7 @@ from db import AsyncSessionLocal
 from models import Message as DbMessage, User, Group, TeacherMessageLink
 from utils.roles import is_admin, is_teacher
 from aiogram.exceptions import TelegramBadRequest
+
 router = Router()
 settings = get_settings()
 STUDENTS_PAGE_SIZE = 10
@@ -385,72 +386,53 @@ async def _find_any_users_by_identifier(session, identifier: str) -> list[User]:
     return res.scalars().all()
 
 
-async def _render_students_page(target_message: Message, page: int = 0, teacher_id: int | None = None) -> None:
-    """
-    teacher_id=None  -> показати всіх студентів (адмін)
-    teacher_id=int   -> показати лише студентів викладача (teacher)
-    """
+async def _render_students_page(target_message: Message, page: int = 0, teacher_id: int | None = None):
     async with AsyncSessionLocal() as session:
-        base_where = [User.role == "student"]
-
+        q_count = select(func.count(User.id)).where(User.role == "student")
         if teacher_id is not None:
-            base_where.append(User.assigned_teacher_id == teacher_id)
+            q_count = q_count.where(User.assigned_teacher_id == teacher_id)
 
-        # count
-        count_res = await session.execute(
-            select(func.count(User.id)).where(*base_where)
-        )
-        total = count_res.scalar() or 0
-
-        if total == 0:
-            await target_message.edit_text("Учнів не знайдено.", reply_markup=None)
+        total_students = (await session.execute(q_count)).scalar() or 0
+        if total_students == 0:
+            await target_message.edit_text("Учнів поки немає.", reply_markup=None)
             return
 
-        total_pages = (total + STUDENTS_PER_PAGE - 1) // STUDENTS_PER_PAGE
+        total_pages = (total_students + STUDENTS_PER_PAGE - 1) // STUDENTS_PER_PAGE
         page = max(0, min(page, total_pages - 1))
         offset = page * STUDENTS_PER_PAGE
 
-        res = await session.execute(
+        q_list = (
             select(User)
-            .where(*base_where)
+            .where(User.role == "student")
             .order_by(User.display_name)
             .offset(offset)
             .limit(STUDENTS_PER_PAGE)
         )
-        students = res.scalars().all()
+        if teacher_id is not None:
+            q_list = q_list.where(User.assigned_teacher_id == teacher_id)
+
+        students = (await session.execute(q_list)).scalars().all()
 
     kb = InlineKeyboardBuilder()
 
     for s in students:
         name = s.display_name or f"ID {s.id}"
-
-        # якщо в тебе є поле активності — покажемо статус
-        status = ""
-        if hasattr(s, "is_active"):
-            status = " ✅" if s.is_active else " 🚫"
-
+        status_icon = "✅" if getattr(s, "is_active", True) else "⛔️"
         kb.button(
-            text=f"{name}{status}",
-            callback_data=f"stud:{s.id}:0",   # або твій формат для відкриття картки/історії
+            text=f"{name} {status_icon}",
+            callback_data=f"hist:{s.id}:0",  # <-- ОЦЕ ГОЛОВНЕ
         )
 
-    kb.adjust(1)
-
-    # пагінація
+    # пагінація списку учнів
     if page > 0:
-        kb.button(text="⬅️ Попередня", callback_data=f"stud_page:{page-1}")
+        kb.button(text="⬅️ Попередня", callback_data=f"stud_page:{page - 1}")
     if page < total_pages - 1:
-        kb.button(text="➡️ Наступна", callback_data=f"stud_page:{page+1}")
+        kb.button(text="➡️ Наступна", callback_data=f"stud_page:{page + 1}")
+
     kb.adjust(1)
 
-    header = "Список учнів"
-    if teacher_id is not None:
-        header = "Ваші учні"
-
-    await target_message.edit_text(
-        f"{header} (сторінка {page+1}/{total_pages}):",
-        reply_markup=kb.as_markup()
-    )
+    title = f"Список учнів (сторінка {page + 1}/{total_pages}):"
+    await target_message.edit_text(title, reply_markup=kb.as_markup())
 
 
 MEDIA_EMOJI = {
@@ -462,53 +444,39 @@ MEDIA_EMOJI = {
 }
 
 
-async def _render_history_page(target_message: Message, student_id: int, page: int = -1) -> None:
+async def _render_history_page(target_message: Message, student_id: int, page: int = 0) -> None:
     async with AsyncSessionLocal() as session:
-        count_res = await session.execute(
+        total_msgs = (await session.execute(
             select(func.count(DbMessage.id)).where(
-                (DbMessage.from_user_id == student_id)
-                | (DbMessage.to_user_id == student_id)
+                (DbMessage.from_user_id == student_id) | (DbMessage.to_user_id == student_id)
             )
-        )
-        total_msgs = count_res.scalar() or 0
+        )).scalar() or 0
 
         if total_msgs == 0:
             await target_message.edit_text("Історія для цього користувача порожня.", reply_markup=None)
             return
 
         total_pages = (total_msgs + MSGS_PER_PAGE - 1) // MSGS_PER_PAGE
+        page = max(0, min(page, total_pages - 1))
 
-        # ✅ якщо відкриття "історії" — показуємо найновіші
-        if page == -1:
-            page = total_pages - 1
+        # ВАЖЛИВО: беремо блок з кінця
+        start_from_end = max(total_msgs - (page + 1) * MSGS_PER_PAGE, 0)
 
-        if page < 0:
-            page = 0
-        if page >= total_pages:
-            page = total_pages - 1
-
-        offset = page * MSGS_PER_PAGE
-
-        res = await session.execute(
+        msgs = (await session.execute(
             select(DbMessage)
-            .where(
-                (DbMessage.from_user_id == student_id)
-                | (DbMessage.to_user_id == student_id)
-            )
-            .order_by(DbMessage.created_at)  # ASC, щоб всередині сторінки було як в чаті
-            .offset(offset)
+            .where((DbMessage.from_user_id == student_id) | (DbMessage.to_user_id == student_id))
+            .order_by(DbMessage.created_at)
+            .offset(start_from_end)
             .limit(MSGS_PER_PAGE)
-        )
-        msgs = res.scalars().all()
+        )).scalars().all()
 
-        user_res = await session.execute(select(User).where(User.id == student_id))
-        student = user_res.scalar_one_or_none()
+        student = (await session.execute(select(User).where(User.id == student_id))).scalar_one_or_none()
 
     header_name = student.display_name if student and student.display_name else str(student_id)
 
     lines = [
         f"Історія діалогу з учнем: {header_name}",
-        f"Сторінка {page + 1}/{total_pages} (показані найновіші, гортай до старих)",
+        f"Сторінка {page + 1}/{total_pages}",
         "",
     ]
 
@@ -518,10 +486,10 @@ async def _render_history_page(target_message: Message, student_id: int, page: i
         prefix = f"[{ts}] {direction}"
 
         body = m.text or ""
-        if m.has_media:
+        if m.has_media and m.media_file_id:
             kind = getattr(m, "media_kind", None)
             body_media = MEDIA_EMOJI.get(kind, "📎 Медіа")
-            body = f"{body}\n{body_media}" if body else body_media
+            body = f"{body}\n{body_media}".strip() if body else body_media
 
         lines.append(f"{prefix}\n{body}\n")
 
@@ -531,27 +499,17 @@ async def _render_history_page(target_message: Message, student_id: int, page: i
 
     kb = InlineKeyboardBuilder()
 
-    # ✅ Пагінація "як у чаті": від нових до старих
-    # Старіші = page + 1
-    if page < total_pages - 1:
-        kb.button(
-            text="⬅️ Старіші",
-            callback_data=f"hist:{student_id}:{page + 1}",
-        )
-
-    # Новіші = page - 1
+    # Новіші/старіші (page=0 найновіші)
     if page > 0:
-        kb.button(
-            text="➡️ Новіші",
-            callback_data=f"hist:{student_id}:{page - 1}",
-        )
+        kb.button(text="➡️ Новіші", callback_data=f"hist:{student_id}:{page - 1}")
+    if page < total_pages - 1:
+        kb.button(text="⬅️ Старіші", callback_data=f"hist:{student_id}:{page + 1}")
 
     kb.button(text="⬅️ Назад до списку учнів", callback_data="stud_page:0")
     kb.button(text="📎 Показати медіа зі сторінки", callback_data=f"hist_media:{student_id}:{page}")
     kb.adjust(1)
 
     await target_message.edit_text(text or "Немає повідомлень.", reply_markup=kb.as_markup())
-
 
 
 async def _render_assign_group_page(
@@ -685,16 +643,15 @@ async def students_page_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+
 @router.callback_query(F.data.startswith("hist:"))
 async def admin_history_callback(callback: CallbackQuery):
     if not callback.from_user:
-        await callback.answer("Недостатньо прав.", show_alert=True)
         return
 
     user_id = callback.from_user.id
     is_adm = await is_admin(user_id)
     is_tch = await is_teacher(user_id)
-
     if not (is_adm or is_tch):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
@@ -707,27 +664,17 @@ async def admin_history_callback(callback: CallbackQuery):
         await callback.answer("Некоректні дані.", show_alert=True)
         return
 
-    # ✅ ВАЖЛИВО: якщо це викладач — перевіряємо, що студент його
+    # якщо це викладач (і не адмін) — перевіряємо прив'язку
     if is_tch and not is_adm:
         async with AsyncSessionLocal() as session:
-            res = await session.execute(
-                select(User.id).where(
-                    User.id == student_id,
-                    User.role == "student",
-                    User.assigned_teacher_id == user_id,
-                )
-            )
-            ok = res.scalar_one_or_none()
+            s = (await session.execute(select(User).where(User.id == student_id))).scalar_one_or_none()
+            if not s or s.assigned_teacher_id != user_id:
+                await callback.answer("Цей учень не закріплений за вами.", show_alert=True)
+                return
 
-        if not ok:
-            await callback.answer("Цей учень не закріплений за вами.", show_alert=True)
-            return
-
-    # історію завжди шлемо новим повідомленням
     target = await callback.message.answer("Завантажую історію...")
     await _render_history_page(target, student_id=student_id, page=page)
     await callback.answer()
-
 
 
 @router.message(F.text.startswith("/groups"))
