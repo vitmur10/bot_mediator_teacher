@@ -134,28 +134,15 @@ def _extract_media_info(message: Message):
 async def _send_to_student_via_bot(message: Message, student_id: int):
     """
     Відправка повідомлення від вчителя учню з підтримкою медіа.
-    Повертає: (sent_message, text, has_media, media_file_id)
-    БЕЗ media_kind, щоб не чіпати БД.
+
+    Повертає:
+        (sent_message, text, has_media, media_file_id, media_kind)
     """
-    text = message.text or message.caption or ""
+    text = (message.text or message.caption or "").strip()
 
-    # якщо тексту немає — проставляємо короткий placeholder
-    if not text:
-        if message.voice:
-            text = "🎤 Голосове"
-        elif message.audio:
-            text = "🎵 Аудіо"
-        elif message.video:
-            text = "🎬 Відео"
-        elif message.document:
-            text = "📄 Документ"
-        elif message.photo:
-            text = "📷 Фото"
-
-    has_media = bool(message.photo or message.document or message.voice or message.audio or message.video)
-
+    # визначаємо медіа
     media_file_id = None
-    media_kind = None  # локально, НЕ повертаємо і НЕ пишемо в БД
+    media_kind = None
 
     if message.photo:
         media_file_id = message.photo[-1].file_id
@@ -173,24 +160,56 @@ async def _send_to_student_via_bot(message: Message, student_id: int):
         media_file_id = message.video.file_id
         media_kind = "video"
 
-    if has_media and media_file_id:
-        if media_kind == "photo":
-            sent = await message.bot.send_photo(chat_id=student_id, photo=media_file_id, caption=text or None)
-        elif media_kind == "document":
-            sent = await message.bot.send_document(chat_id=student_id, document=media_file_id, caption=text or None)
-        elif media_kind == "voice":
-            sent = await message.bot.send_voice(chat_id=student_id, voice=media_file_id, caption=text or None)
+    has_media = bool(media_kind and media_file_id)
+
+    # якщо тексту немає — проставляємо placeholder (як у тебе було)
+    if not text:
+        if media_kind == "voice":
+            text = "🎤 Голосове"
         elif media_kind == "audio":
-            sent = await message.bot.send_audio(chat_id=student_id, audio=media_file_id, caption=text or None)
+            text = "🎵 Аудіо"
         elif media_kind == "video":
-            sent = await message.bot.send_video(chat_id=student_id, video=media_file_id, caption=text or None)
+            text = "🎬 Відео"
+        elif media_kind == "document":
+            text = "📄 Документ"
+        elif media_kind == "photo":
+            text = "📷 Фото"
         else:
-            sent = await message.bot.send_message(chat_id=student_id, text=text)
+            text = ""
+
+    # caption має ліміти — не будемо ризикувати
+    caption = text[:900] if text else None
+
+    # відправка
+    if has_media:
+        if media_kind == "photo":
+            sent = await message.bot.send_photo(
+                chat_id=student_id, photo=media_file_id, caption=caption
+            )
+        elif media_kind == "document":
+            sent = await message.bot.send_document(
+                chat_id=student_id, document=media_file_id, caption=caption
+            )
+        elif media_kind == "voice":
+            # ⚠️ voice: без caption
+            sent = await message.bot.send_voice(
+                chat_id=student_id, voice=media_file_id
+            )
+        elif media_kind == "audio":
+            sent = await message.bot.send_audio(
+                chat_id=student_id, audio=media_file_id, caption=caption
+            )
+        elif media_kind == "video":
+            sent = await message.bot.send_video(
+                chat_id=student_id, video=media_file_id, caption=caption
+            )
+        else:
+            sent = await message.bot.send_message(chat_id=student_id, text=text or " ")
     else:
-        sent = await message.bot.send_message(chat_id=student_id, text=text)
+        # чистий текст
+        sent = await message.bot.send_message(chat_id=student_id, text=text or " ")
 
-    return sent, text, has_media, media_file_id
-
+    return sent, text, has_media, media_file_id, media_kind
 
 @router.message(F.reply_to_message, ~F.text.startswith("/to"))
 async def teacher_reply(message: Message):
