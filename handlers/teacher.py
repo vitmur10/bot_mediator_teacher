@@ -397,7 +397,6 @@ async def teacher_free_text_after_to(message: Message, state: FSMContext):
         return
 
     # Якщо це команда або reply — нехай обробляють інші хендлери
-    # (message.text може бути None, тому перевіряємо обережно)
     if (message.text or "").startswith("/"):
         return
     if message.reply_to_message:
@@ -410,19 +409,27 @@ async def teacher_free_text_after_to(message: Message, state: FSMContext):
         return
 
     async with AsyncSessionLocal() as session:
-        res_student = await session.execute(
-            select(User).where(User.id == int(student_id))
-        )
+        res_student = await session.execute(select(User).where(User.id == int(student_id)))
         student = res_student.scalar_one_or_none()
         if not student:
             await message.answer("Учня не знайдено в базі.")
             await state.clear()
             return
 
-        # ВАЖЛИВО: _send_to_student_via_bot має повертати РІВНО 4 значення
-        sent, text, has_media, media_file_id = await _send_to_student_via_bot(
-            message, student.id
-        )
+        # ✅ очікуємо 5 значень
+        try:
+            sent, text, has_media, media_file_id, media_kind =  await _send_to_student_via_bot(message, student.id)
+        except Exception as e:
+            # Якщо бот не може доставити (user не натиснув /start, заблокував бота, мережа і т.д.)
+            await message.answer(
+                f"Не вдалося надіслати повідомлення учню: {student.display_name or student.id}\n"
+                f"Причина: {type(e).__name__}"
+            )
+            await state.clear()
+            return
+
+        # sent може бути None, якщо ти так вирішиш у _send_to_student_via_bot (але краще завжди повертати Message)
+        tg_message_id = getattr(sent, "message_id", None)
 
         session.add(
             DbMessage(
@@ -432,7 +439,8 @@ async def teacher_free_text_after_to(message: Message, state: FSMContext):
                 text=text,
                 has_media=has_media,
                 media_file_id=media_file_id,
-                tg_message_id=sent.message_id,
+                media_kind=media_kind,
+                tg_message_id=tg_message_id,
             )
         )
         await session.commit()

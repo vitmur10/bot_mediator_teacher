@@ -2424,7 +2424,7 @@ def format_media_footer(m: DbMessage) -> str:
 @router.callback_query(F.data.startswith("hist_media:"))
 async def admin_history_media_callback(callback: CallbackQuery):
     if not callback.from_user or not (
-            await is_admin(callback.from_user.id) or await is_teacher(callback.from_user.id)
+        await is_admin(callback.from_user.id) or await is_teacher(callback.from_user.id)
     ):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
@@ -2437,14 +2437,13 @@ async def admin_history_media_callback(callback: CallbackQuery):
         await callback.answer("Некоректні дані.", show_alert=True)
         return
 
+    viewer_id = callback.from_user.id
+
     async with AsyncSessionLocal() as session:
         offset = page * MSGS_PER_PAGE
         res = await session.execute(
             select(DbMessage)
-            .where(
-                (DbMessage.from_user_id == student_id)
-                | (DbMessage.to_user_id == student_id)
-            )
+            .where((DbMessage.from_user_id == student_id) | (DbMessage.to_user_id == student_id))
             .order_by(DbMessage.created_at)
             .offset(offset)
             .limit(MSGS_PER_PAGE)
@@ -2456,30 +2455,95 @@ async def admin_history_media_callback(callback: CallbackQuery):
         await callback.answer("На цій сторінці немає медіа.", show_alert=True)
         return
 
+    # максимум за раз, щоб не заспамити
+    media_msgs = media_msgs[:10]
+
     await callback.answer(f"Надсилаю медіа: {len(media_msgs)} шт.", show_alert=False)
 
-    for m in media_msgs[:10]:
-        kind = getattr(m, "media_kind", None)
-        caption = (m.text or "")[:900] or MEDIA_EMOJI.get(kind, "📎 Медіа")
-
+    async def _send_with_kind(kind: str, file_id: str, caption: str):
+        """Надсилає медіа певного типу. Кидає exception якщо не вийшло."""
         if kind == "photo":
-            await callback.bot.send_photo(callback.from_user.id, m.media_file_id, caption=caption)
-        elif kind == "document":
-            await callback.bot.send_document(callback.from_user.id, m.media_file_id, caption=caption)
-        elif kind == "voice":
-            await callback.bot.send_voice(callback.from_user.id, m.media_file_id)
-        elif kind == "audio":
-            await callback.bot.send_audio(callback.from_user.id, m.media_file_id, caption=caption)
-        elif kind == "video":
-            await callback.bot.send_video(callback.from_user.id, m.media_file_id, caption=caption)
-        else:
-            await callback.bot.send_message(
-                callback.from_user.id,
-                f"📎 Медіа: {caption}"
-            )
+            return await callback.bot.send_photo(viewer_id, file_id, caption=caption)
+        if kind == "document":
+            return await callback.bot.send_document(viewer_id, file_id, caption=caption)
+        if kind == "video":
+            return await callback.bot.send_video(viewer_id, file_id, caption=caption)
+        if kind == "audio":
+            return await callback.bot.send_audio(viewer_id, file_id, caption=caption)
+        if kind == "voice":
+            # у voice немає caption — повертаємо message, а футер пошлемо окремо
+            return await callback.bot.send_voice(viewer_id, file_id)
+        raise ValueError("Unsupported kind")
 
-        # ✅ ОЦЕ ГОЛОВНЕ — підпис ПІД медіа
-        await callback.bot.send_message(
-            callback.from_user.id,
-            format_media_footer(m)
-        )
+    # порядок fallback, якщо kind не збережений або неправильний
+    FALLBACK_ORDER = ("photo", "document", "video", "audio", "voice")
+
+    for m in media_msgs:
+        kind = (getattr(m, "media_kind", None) or "").strip() or None
+
+        footer = format_media_footer(m)
+        base_caption = (m.text or "").strip()
+        # caption ліміт 1024, але краще тримати запас
+        caption = (base_caption[:700] if base_caption else MEDIA_EMOJI.get(kind, "📎 Медіа"))
+        # підшиваємо футер в caption, щоб не плодити повідомлення
+        caption_with_footer = (f"{caption}\n\n{footer}")[:950]
+
+        try:
+            # 1) якщо kind відомий — пробуємо його
+            if kind in FALLBACK_ORDER:
+                sent = await _send_with_kind(kind, m.media_file_id, caption_with_footer)
+                # якщо voice — окремо футер (бо caption нема)
+                if kind == "voice":
+                    await callback.bot.send_message(viewer_id, footer)
+                continue
+
+            # 2) якщо kind невідомий/None — fallback по типах
+            sent = None
+            last_err = None
+            for k in FALLBACK_ORDER:
+                try:
+                    sent = await _send_with_kind(k, m.media_file_id, caption_with_footer)
+                    if k == "voice":
+                        await callback.bot.send_message(viewer_id, footer)
+                    break
+                except TelegramBadRequest as e:
+                    last_err = e
+                    continue
+
+            if sent is None:
+                # нічого не підійшло
+                await callback.bot.send_message(
+                    viewer_id,
+                    f"❌ Не вдалося відправити медіа (невідомий тип/битий file_id).\n{footer}"
+                )
+
+        except TelegramForbiddenError:
+            # користувач не натиснув /start або заблокував бота
+            await callback.answer(
+                "Я не можу надіслати вам медіа. Відкрийте бота та натисніть Start (/start).",
+                show_alert=True
+            )
+            return
+
+        except TelegramRetryAfter as e:
+            # якщо телеграм просить почекати (rate limit)
+            await callback.bot.send_message(
+                viewer_id,
+                f"⏳ Telegram просить зачекати {e.retry_after} сек. Спробуйте ще раз трохи пізніше."
+            )
+            return
+
+        except TelegramNetworkError:
+            await callback.bot.send_message(
+                viewer_id,
+                "⚠️ Тимчасова мережева помилка Telegram. Спробуйте ще раз."
+            )
+            return
+
+        except Exception:
+            # щоб один битий запис не ламав весь список
+            await callback.bot.send_message(
+                viewer_id,
+                f"❌ Помилка при надсиланні медіа.\n{footer}"
+            )
+            continue
