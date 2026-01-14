@@ -211,59 +211,7 @@ async def _send_to_student_via_bot(message: Message, student_id: int):
 
     return sent, text, has_media, media_file_id, media_kind
 
-@router.message(F.reply_to_message, ~F.text.startswith("/to"))
-async def teacher_reply(message: Message):
-    """
-    Відповідь вчителя через стандартний Reply на повідомлення,
-    яке бот надіслав від учня (з текстом або медіа).
-    """
-    if not await is_teacher(message.from_user.id):
-        return
 
-    replied = message.reply_to_message
-    if not replied:
-        return
-
-    async with AsyncSessionLocal() as session:
-        # шукаємо, якому студенту належало повідомлення, на яке відповіли
-        res_link = await session.execute(
-            select(TeacherMessageLink).where(
-                TeacherMessageLink.teacher_tg_message_id == replied.message_id
-            )
-        )
-        link = res_link.scalar_one_or_none()
-        if not link:
-            await message.answer("Не вдалося визначити учня для цієї відповіді.")
-            return
-
-        res_student = await session.execute(
-            select(User).where(User.id == link.student_id)
-        )
-        student = res_student.scalar_one_or_none()
-        if not student:
-            await message.answer("Учня не знайдено в базі.")
-            return
-
-        # відправляємо учню з підтримкою медіа
-        sent, text, has_media, media_file_id, media_kind = await _send_to_student_via_bot(message, student.id)
-
-        # лог в БД
-        db_msg = DbMessage(
-            from_user_id=message.from_user.id,
-            to_user_id=student.id,
-            direction="teacher_to_student",
-            text=text,
-            has_media=has_media,
-            media_file_id=media_file_id,
-            media_kind=media_kind,
-            tg_message_id=sent.message_id,
-        )
-        session.add(db_msg)
-        await session.commit()
-
-    await message.answer(
-        f"Повідомлення надіслано учню: {student.display_name or student.id}"
-    )
 
 
 @router.message(F.text.startswith("/to"))
@@ -437,7 +385,7 @@ async def teacher_free_text_after_to(message: Message, state: FSMContext):
 
         # ✅ очікуємо 5 значень
         try:
-            sent, text, has_media, media_file_id, media_kind =  await _send_to_student_via_bot(message, student.id)
+            sent, text, has_media, media_file_id, media_kind = await _send_to_student_via_bot(message, student.id)
         except Exception as e:
             # Якщо бот не може доставити (user не натиснув /start, заблокував бота, мережа і т.д.)
             await message.answer(

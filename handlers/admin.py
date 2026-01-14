@@ -8,7 +8,7 @@ from config import get_settings
 from db import AsyncSessionLocal
 from models import Message as DbMessage, User, Group, TeacherMessageLink
 from utils.roles import is_admin, is_teacher
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter, TelegramForbiddenError
 
 router = Router()
 settings = get_settings()
@@ -641,7 +641,6 @@ async def students_page_callback(callback: CallbackQuery):
     teacher_id = user_id if is_tch and not is_adm else None
     await _render_students_page(callback.message, page=page, teacher_id=teacher_id)
     await callback.answer()
-
 
 
 @router.callback_query(F.data.startswith("hist:"))
@@ -2424,7 +2423,7 @@ def format_media_footer(m: DbMessage) -> str:
 @router.callback_query(F.data.startswith("hist_media:"))
 async def admin_history_media_callback(callback: CallbackQuery):
     if not callback.from_user or not (
-        await is_admin(callback.from_user.id) or await is_teacher(callback.from_user.id)
+            await is_admin(callback.from_user.id) or await is_teacher(callback.from_user.id)
     ):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
@@ -2465,7 +2464,7 @@ async def admin_history_media_callback(callback: CallbackQuery):
         if kind == "photo":
             return await callback.bot.send_photo(viewer_id, file_id, caption=caption)
         if kind == "document":
-            return await callback.bot.send_document(viewer_id, file_id, caption=caption)
+            return await callback.bot.send_document(chat_id=viewer_id, document=file_id, caption=caption)
         if kind == "video":
             return await callback.bot.send_video(viewer_id, file_id, caption=caption)
         if kind == "audio":
